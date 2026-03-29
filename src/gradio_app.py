@@ -1,373 +1,560 @@
+import gc
 import os
-import sys
 from pathlib import Path
-import gradio as gr
-from PIL import Image
-import pytesseract
-import easyocr
-import cv2
-import logging
-logging.disable(logging.WARNING)
 
+import gradio as gr
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
 from torchvision import transforms
-from importlib.util import spec_from_file_location, module_from_spec
-import os 
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
+cv2 = None
+cv2_import_error = None
 try:
-    from paddleocr import PaddleOCR
-except ImportError:
-    PaddleOCR = None
+    import cv2  # type: ignore[assignment]
+except Exception as err:
+    cv2 = None
+    cv2_import_error = str(err)
 
-# ---------------------------------------------------------
-# ENV / HELPERS
-# ---------------------------------------------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+torch.set_num_threads(max(1, min(2, os.cpu_count() or 2)))
+
 ROOT = Path(__file__).resolve().parents[1]
-MALLANET_ROOT = ROOT / "MallaNet"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CHECKPOINT_PATH = ROOT / "MallaNet" / "models" / "best_model.pth"
 
-if MALLANET_ROOT.exists():
-    sys.path.insert(0, str(MALLANET_ROOT))
 
-# EasyOCR reader placeholder (Lazy loaded)
-reader = None
+# ---------------------------------------------------------
+# MallaNet architecture (minimal inference-only copy)
+# ---------------------------------------------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, dropout_rate=0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout(dropout_rate)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
 
-paddle_ocr = None
-def get_paddle():
-    global paddle_ocr
-    if paddle_ocr is None and PaddleOCR is not None:
-        try:
-            paddle_ocr = PaddleOCR(use_textline_orientation=True, lang='en')
-        except Exception as e:
-            print('PaddleOCR load failed:', e)
-    return paddle_ocr
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.dropout(out)
+        out = out + identity
+        out = self.relu(out)
+        return out
 
-# load module helper (for non-package structure)
-def load_module_from_path(name, path):
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Cannot find module file: {path}")
-    spec = spec_from_file_location(name, str(path))
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
-# -------------
-# Load custom model classes
-# -------------
-english_model_cls = None
-devanagari_model_cls = None
+class HFCLayer(nn.Module):
+    def __init__(self, num_classes, d_b):
+        super().__init__()
+        self.num_classes = num_classes
+        self.V = nn.Parameter(torch.randn(num_classes, d_b))
+        self.bn = nn.BatchNorm1d(num_classes * d_b)
 
-try:
-    eng_mod = load_module_from_path('english_model', MALLANET_ROOT / 'experiments' / 'english' / 'one_model' / 'english.py')
-    english_model_cls = getattr(eng_mod, 'EnhancedBMCNNwHFCs', None)
-except Exception as e:
-    print('English model module load failed:', e)
+    def forward(self, x):
+        u_b = x.sum(dim=1)
+        u_b_exp = u_b.unsqueeze(1)
+        v_exp = self.V.unsqueeze(0)
+        t_b = u_b_exp * v_exp
+        batch_size = t_b.size(0)
+        t_b_flat = t_b.view(batch_size, -1)
+        t_b_bn = self.bn(t_b_flat)
+        t_b_bn = t_b_bn.view(batch_size, self.num_classes, -1)
+        t_b_relu = F.relu(t_b_bn)
+        logits = t_b_relu.sum(dim=2)
+        return logits
 
-try:
-    # Changed from HVC to HFC devanagari script since the best_model.pth uses HFCs
-    dev_mod = load_module_from_path('devanagari_model', MALLANET_ROOT / 'experiments' / 'devanagari' / 'ensemble' / 'devanagari_ensemble.py')
-    devanagari_model_cls = getattr(dev_mod, 'EnhancedBMCNNwHFCs', None)
-except Exception as e:
-    print('Devanagari model module load failed:', e)
 
-# -------------
-# Checkpoint
-# -------------
-checkpoint_path = ROOT / "MallaNet" / "models" / "best_model.pth"
-if checkpoint_path.exists():
-    try:
-        ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-            ckpt = ckpt['model_state_dict']
-    except Exception as e:
-        print('Unable to load checkpoint file', e)
-        ckpt = None
-else:
-    ckpt = None
+class MergingLayer(nn.Module):
+    def __init__(self, num_branches=3):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(num_branches) / num_branches)
 
-english_model = None
-devanagari_model = None
+    def forward(self, inputs):
+        weights = F.softmax(self.w, dim=0)
+        return sum(weight * logit for weight, logit in zip(weights, inputs))
+
+
+class BMCNNBase(nn.Module):
+    def __init__(self, dropout_rate=0.0):
+        super().__init__()
+        self.conv_block1 = nn.Sequential(
+            ResidualBlock(1, 128, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(128, 128, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(128, 128, stride=1, dropout_rate=dropout_rate),
+        )
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv_block2 = nn.Sequential(
+            ResidualBlock(128, 256, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(256, 256, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(256, 256, stride=1, dropout_rate=dropout_rate),
+        )
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.conv_block3 = nn.Sequential(
+            ResidualBlock(256, 512, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(512, 512, stride=1, dropout_rate=dropout_rate),
+            ResidualBlock(512, 512, stride=1, dropout_rate=dropout_rate),
+        )
+
+    def forward(self, x):
+        x1 = self.conv_block1(x)
+        x = self.pool1(x1)
+        x2 = self.conv_block2(x)
+        x = self.pool2(x2)
+        x3 = self.conv_block3(x)
+        return x1, x2, x3
+
+
+class EnhancedBMCNNwHFCs(BMCNNBase):
+    def __init__(self, num_classes=46, dropout_rate=0.0):
+        super().__init__(dropout_rate=dropout_rate)
+        self.hfc1 = HFCLayer(num_classes, d_b=32 * 32)
+        self.hfc2 = HFCLayer(num_classes, d_b=16 * 16)
+        self.hfc3 = HFCLayer(num_classes, d_b=8 * 8)
+        self.merging = MergingLayer(num_branches=3)
+
+    def forward(self, x):
+        x1, x2, x3 = super().forward(x)
+        x1_reshaped = x1.view(x1.size(0), x1.size(1), -1)
+        x2_reshaped = x2.view(x2.size(0), x2.size(1), -1)
+        x3_reshaped = x3.view(x3.size(0), x3.size(1), -1)
+        logit1 = self.hfc1(x1_reshaped)
+        logit2 = self.hfc2(x2_reshaped)
+        logit3 = self.hfc3(x3_reshaped)
+        return self.merging((logit1, logit2, logit3))
+
+
+# ---------------------------------------------------------
+# Labels (DHCD: 10 digits + 36 consonants)
+# ---------------------------------------------------------
+DEVANAGARI_DIGITS = [chr(cp) for cp in range(0x0966, 0x0970)]
+DEVANAGARI_CONSONANTS = [
+    "\u0915", "\u0916", "\u0917", "\u0918", "\u0919", "\u091A", "\u091B", "\u091C", "\u091D", "\u091E",
+    "\u091F", "\u0920", "\u0921", "\u0922", "\u0923", "\u0924", "\u0925", "\u0926", "\u0927", "\u0928",
+    "\u092A", "\u092B", "\u092C", "\u092D", "\u092E", "\u092F", "\u0930", "\u0932", "\u0935", "\u0936",
+    "\u0937", "\u0938", "\u0939", "\u0915\u094d\u0937", "\u0924\u094d\u0930", "\u091C\u094d\u091E",
+]
+DEVANAGARI_CLASSES = DEVANAGARI_DIGITS + DEVANAGARI_CONSONANTS
+DEVANAGARI_LABELS = {i: DEVANAGARI_CLASSES[i] for i in range(46)}
+NEPALI_TO_ASCII_DIGIT = {digit: str(idx) for idx, digit in enumerate(DEVANAGARI_DIGITS)}
+
+
+_MODEL = None
+_MODEL_ERROR = None
+_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ]
+)
+
 
 def _clean_state_dict(state_dict):
-    """Strip module prefixes and convert any cpu/cuda mismatched keys."""
-    if not isinstance(state_dict, dict):
-        return state_dict
-    clean = {}
-    for k, v in state_dict.items():
-        new_key = k
-        if k.startswith('module.'):
-            new_key = k[len('module.'):]
-        clean[new_key] = v
-    return clean
+    cleaned = {}
+    for key, value in state_dict.items():
+        cleaned[key[7:] if key.startswith("module.") else key] = value
+    return cleaned
 
 
-def _load_model_weights(model, state_dict):
+def get_devanagari_model():
+    global _MODEL, _MODEL_ERROR
+    if _MODEL is not None:
+        return _MODEL
+    if _MODEL_ERROR is not None:
+        return None
+
+    if not CHECKPOINT_PATH.exists():
+        _MODEL_ERROR = f"Checkpoint not found: {CHECKPOINT_PATH}"
+        return None
+
     try:
-        r = model.load_state_dict(state_dict)
-        if r.missing_keys:
-            print('State dict missing keys:', r.missing_keys)
-        if r.unexpected_keys:
-            print('State dict unexpected keys:', r.unexpected_keys)
-        return True
-    except RuntimeError as e:
-        print('RuntimeError during load_state_dict:', e)
-        # try stripping module prefix fallback
-        clean_state = _clean_state_dict(state_dict)
+        loaded = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        state = loaded["model_state_dict"] if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded
+        model = EnhancedBMCNNwHFCs(num_classes=46, dropout_rate=0.0).to(DEVICE)
         try:
-            r = model.load_state_dict(clean_state)
-            if r.missing_keys:
-                print('Fallback missing keys:', r.missing_keys)
-            if r.unexpected_keys:
-                print('Fallback unexpected keys:', r.unexpected_keys)
-            return True
-        except Exception as e2:
-            print('Fallback load_state_dict also failed:', type(e2).__name__, e2)
-            return False
-    except Exception as e:
-        print('Error during load_state_dict:', type(e).__name__, e)
-        return False
+            model.load_state_dict(state)
+        except Exception:
+            model.load_state_dict(_clean_state_dict(state))
+        model.eval()
+        _MODEL = model
+        return _MODEL
+    except Exception as err:
+        _MODEL_ERROR = str(err)
+        return None
 
 
-if english_model_cls is not None and ckpt is not None:
-    for num_classes in [46, 10]:
-        try:
-            m = english_model_cls(num_classes=num_classes)
-            if _load_model_weights(m, ckpt):
-                m.to(DEVICE).eval()
-                english_model = m
-                print(f'English custom model loaded successfully with num_classes={num_classes}')
-                break
-        except Exception as e:
-            print(f'English model instantiate failed for num_classes={num_classes}:', type(e).__name__, e)
-    else:
-        print('English custom model could not be loaded')
-
-if devanagari_model_cls is not None and ckpt is not None:
-    for num_classes in [46, 10]:
-        try:
-            d = devanagari_model_cls(num_classes=num_classes)
-            if _load_model_weights(d, ckpt):
-                d.to(DEVICE).eval()
-                devanagari_model = d
-                print(f'Devanagari custom model loaded successfully with num_classes={num_classes}')
-                break
-        except Exception as e:
-            print(f'Devanagari model instantiate failed for num_classes={num_classes}:', type(e).__name__, e)
-    else:
-        print('Devanagari custom model could not be loaded')
-
-ENGLISH_LABELS = {i: str(i) for i in range(10)}
-NEPALI_CHARS = [
-    'क','ख','ग','घ','ङ','च','छ','ज','झ','ञ','ट','ठ','ड','ढ','ण','त','थ','द','ध','न',
-    'प','फ','ब','भ','म','य','र','ल','व','श','ष','स','ह','क्ष','त्र','ज्ञ','ळ','क्ष',
-    'श्र','ऋ','ए','ऐ','ओ','औ'  # approx 46 classes sample, adjust to actual class maps
-]
-DEVANAGARI_LABELS = {i: NEPALI_CHARS[i] if i < len(NEPALI_CHARS) else f"char_{i}" for i in range(46)}
-
-# ---------------------------------------------------------
-# MODEL FUNCTIONS
-# ---------------------------------------------------------
-
-def tesseract_ocr(image):
-    try:
-        text = pytesseract.image_to_string(image, lang='nep+eng')
-        if not text.strip():
-            text = pytesseract.image_to_string(image, lang='eng')
-        return text if text.strip() else '(No text detected)'
-    except Exception as e:
-        return f"Tesseract error: {e}"
+def unload_model():
+    global _MODEL
+    if _MODEL is not None:
+        _MODEL = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
-def easyocr_extraction(image):
-    global reader
-    if reader is None:
-        reader = easyocr.Reader(['en', 'ne'], gpu=torch.cuda.is_available())
-    img_np = np.array(image)
-    results = reader.readtext(img_np, detail=0)
-    return ' '.join(results) if results else '(No text detected)'
-
-
-def _custom_model_predict(image, model, label_map, image_size=(32,32)):
+def _predict_char(gray_patch):
+    model = get_devanagari_model()
     if model is None:
-        return '(No model loaded)'
-    if image.mode != 'L':
-        image = image.convert('L')
-    transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    x = transform(image).unsqueeze(0).to(DEVICE)
+        return "?", 0.0
+
+    prep = _prepare_char_for_model(gray_patch)
+    if prep is None:
+        return "?", 0.0
+
+    arr = np.array(prep)
+    variants = [prep, Image.fromarray(255 - arr, mode="L")]
+    best_label = "?"
+    best_conf = 0.0
+
     with torch.no_grad():
-        logits = model(x)
-        pred = int(logits.argmax(dim=1).item())
-    label = label_map.get(pred, str(pred))
-    return f"Predicted class {pred} -> {label}"
+        for variant in variants:
+            x = _TRANSFORM(variant).unsqueeze(0).to(DEVICE)
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            conf_val = float(conf.item())
+            pred_idx = int(pred.item())
+            label = DEVANAGARI_LABELS.get(pred_idx, str(pred_idx))
+            if conf_val > best_conf:
+                best_conf = conf_val
+                best_label = label
+
+    if best_conf < 0.30:
+        best_label = "?"
+    return best_label, best_conf
 
 
-def devanagari_custom_model(image):
-    return _custom_model_predict(image, devanagari_model, DEVANAGARI_LABELS, image_size=(64,64))
+def _normalize_plate(gray):
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    norm = clahe.apply(gray)
+    return cv2.bilateralFilter(norm, 5, 60, 60)
 
 
-def paddle_extraction(image):
-    p_ocr = get_paddle()
-    if p_ocr is None:
-        return "(PaddleOCR not installed or failed to load)"
-    img_np = np.array(image.convert('RGB')) # ensure paddle gets 3-channel RGB  
-    # paddle_ocr.predict expects standard arguments.
-    results = p_ocr.ocr(img_np, cls=True)
-    if not results or not results[0]:
-        return "(No text detected)"
-    # results[0] is a list of [box, (text, score)]
-    text = " ".join([res[1][0] for res in results[0]])
-    return text
+def _auto_crop_plate(rgb):
+    h_img, w_img = rgb.shape[:2]
+    if h_img < 80 or w_img < 150:
+        return rgb, False
 
-def english_custom_model(image):
-    # the english custom model uses 28x28 (standard MNIST dimension) or 32x32.
-    return _custom_model_predict(image, english_model, ENGLISH_LABELS, image_size=(32,32))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.bilateralFilter(gray, 9, 75, 75)
+    edges = cv2.Canny(blur, 80, 200)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
 
-def devanagari_custom_model(image):
-    # the devanagari model likely uses 32x32 based on the 1024 tensor mismatch 
-    # (128 channels * 8 * 8 = 8192 or similar. 4096 vs 1024 means image dimension needs adjusting)
-    return _custom_model_predict(image, devanagari_model, DEVANAGARI_LABELS, image_size=(32,32))
-def license_plate_pipeline(image):
-    if devanagari_model is None:
-        return "(MallaNet Devanagari model not loaded. Check checkpoints.)"
-    
-    # 1. Convert to OpenCV format & Grayscale
-    img_np = np.array(image.convert('RGB'))
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    
-    # 2. Thresholding / Binarization (Detect black text on white/red background)
-    # Using Otsu's thresholding
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # 3. Find Character Contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Filter and wrap in bounding boxes
-    rects = []
-    h_img, w_img = img_np.shape[:2]
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-        # Heuristics: Ignore tiny specks and the massive outer border of the plate itself
-        if area > 80 and h > 15 and h < h_img * 0.9: 
-            rects.append((x, y, w, h))
-            
-    if not rects:
-        return "No characters could be isolated by OpenCV."
-        
-    # 4. Sort contours top-to-bottom, then left-to-right (for multi-line plates)
-    rects.sort(key=lambda b: b[1])  # Sort purely by Y coordinate first
-    
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:40]
+
+    best = None
+    best_score = -1.0
+    full_area = float(h_img * w_img)
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+        area_ratio = (w * h) / full_area
+        if area_ratio < 0.04:
+            continue
+        aspect = w / float(h)
+        if aspect < 1.5 or aspect > 7.0:
+            continue
+        score = area_ratio + 0.2 * (1.0 - abs((x + w / 2) - (w_img / 2)) / (w_img / 2 + 1e-6))
+        if score > best_score:
+            best = (x, y, w, h)
+            best_score = score
+
+    if best is None:
+        return rgb, False
+
+    x, y, w, h = best
+    px = max(4, int(0.04 * w))
+    py = max(4, int(0.08 * h))
+    x1 = max(0, x - px)
+    y1 = max(0, y - py)
+    x2 = min(w_img, x + w + px)
+    y2 = min(h_img, y + h + py)
+    return rgb[y1:y2, x1:x2], True
+
+
+def _binary_candidates(gray):
+    norm = _normalize_plate(gray)
+    _, otsu_inv = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(
+        norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    cands = [otsu_inv, adaptive]
+    cleaned = []
+    for cand in cands:
+        c = cv2.morphologyEx(cand, cv2.MORPH_OPEN, kernel, iterations=1)
+        c = cv2.morphologyEx(c, cv2.MORPH_CLOSE, kernel, iterations=1)
+        cleaned.append(c)
+    return cleaned
+
+
+def _extract_boxes(binary):
+    h_img, w_img = binary.shape[:2]
+    area = float(h_img * w_img)
+    min_area = max(35, int(0.00045 * area))
+    max_area = int(0.25 * area)
+    boxes = []
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    for i in range(1, n_labels):
+        x, y, w, h, a = stats[i]
+        if a < min_area or a > max_area:
+            continue
+        if h < int(0.20 * h_img) or h > int(0.98 * h_img):
+            continue
+        if w < int(0.012 * w_img) or w > int(0.75 * w_img):
+            continue
+        aspect = w / float(h)
+        if aspect < 0.08 or aspect > 2.2:
+            continue
+        boxes.append((int(x), int(y), int(w), int(h)))
+    return boxes
+
+
+def _select_best_boxes(gray):
+    best_boxes = []
+    best_score = -1.0
+    width = gray.shape[1]
+    for binary in _binary_candidates(gray):
+        boxes = _extract_boxes(binary)
+        if not boxes:
+            continue
+        heights = np.array([b[3] for b in boxes], dtype=np.float32)
+        n = len(boxes)
+        count_score = 1.0 if 4 <= n <= 16 else max(0.0, 1.0 - abs(n - 9) / 9.0)
+        height_score = max(0.0, 1.0 - float(np.std(heights)) / (float(np.mean(heights)) + 1e-6))
+        coverage = min(1.0, float(np.sum([b[2] for b in boxes])) / (width + 1e-6))
+        score = 0.5 * count_score + 0.3 * height_score + 0.2 * coverage
+        if score > best_score:
+            best_boxes = boxes
+            best_score = score
+    return best_boxes
+
+
+def _group_rows(boxes):
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[1] + b[3] / 2.0)
+    median_h = float(np.median([b[3] for b in boxes]))
+    y_thresh = max(10.0, 0.45 * median_h)
     rows = []
-    current_row = [rects[0]]
-    for r in rects[1:]:
-        # If Y is within 25 pixels of current row's average, keep it in the same row
-        avg_y = sum(b[1] for b in current_row) / len(current_row)
-        if abs(r[1] - avg_y) < 25: 
-            current_row.append(r)
-        else:
-            rows.append(current_row)
-            current_row = [r]
-    rows.append(current_row)
-    
-    # Sort each row horizontally (X-axis)
+    for box in boxes:
+        cy = box[1] + box[3] / 2.0
+        assigned = False
+        for row in rows:
+            row_cy = float(np.mean([r[1] + r[3] / 2.0 for r in row]))
+            if abs(cy - row_cy) <= y_thresh:
+                row.append(box)
+                assigned = True
+                break
+        if not assigned:
+            rows.append([box])
+    rows.sort(key=lambda row: float(np.mean([r[1] for r in row])))
     for row in rows:
         row.sort(key=lambda b: b[0])
-        
-    # 5. Extract and Predict each character via MallaNet
-    results = []
-    for i, row in enumerate(rows):
-        row_text = []
-        for (x, y, w, h) in row:
-            # Pad the crop slightly so MallaNet isn't zoomed in too tight
-            pad = 4
-            x1, y1 = max(0, x-pad), max(0, y-pad)
-            x2, y2 = min(w_img, x+w+pad), min(h_img, y+h+pad)
-            char_img = gray[y1:y2, x1:x2]
-            
-            # Convert crop back to PIL structure exactly like MallaNet expects
-            char_pil = Image.fromarray(char_img)
-            
-            # MallaNet standard inference (32x32 size)
-            res_str = _custom_model_predict(char_pil, devanagari_model, DEVANAGARI_LABELS, image_size=(32,32))
-            
-            # The function returns "Predicted class X -> [CHAR]", we just want the [CHAR]
-            predicted_char = res_str.split("->")[-1].strip()
-            row_text.append(predicted_char)
-            
-        results.append("".join(row_text))
-        
-    return "\n".join(results)
-# Dictionary mapping Model Names to their inference functions.
-AVAILABLE_MODELS = {
-    'License Plate Pipeline (OpenCV + MallaNet)': license_plate_pipeline,
-    'Tesseract OCR': tesseract_ocr,
-    'EasyOCR': easyocr_extraction,
-    'PaddleOCR': paddle_extraction,
-    'Devanagari Custom Model': devanagari_custom_model,
-    'English Custom Model': english_custom_model,
-}
+    return rows
 
-# ---------------------------------------------------------
-# INFERENCE LOGIC
-# ---------------------------------------------------------
 
-def process_extraction(image, selected_models):
+def _prepare_char_for_model(gray_patch):
+    if gray_patch is None or gray_patch.size == 0:
+        return None
+    blur = cv2.GaussianBlur(gray_patch, (3, 3), 0)
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+    fg = cv2.bitwise_not(bw)
+    pts = cv2.findNonZero(fg)
+    if pts is None:
+        return None
+    x, y, w, h = cv2.boundingRect(pts)
+    char = bw[y:y + h, x:x + w]
+    side = max(w, h) + 8
+    canvas = np.full((side, side), 255, dtype=np.uint8)
+    xo = (side - w) // 2
+    yo = (side - h) // 2
+    canvas[yo:yo + h, xo:xo + w] = char
+    resized = cv2.resize(canvas, (32, 32), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(resized, mode="L")
+
+
+def _ascii_digits_only(text):
+    out = []
+    for ch in text:
+        if ch in NEPALI_TO_ASCII_DIGIT:
+            out.append(NEPALI_TO_ASCII_DIGIT[ch])
+        elif ch.isdigit():
+            out.append(ch)
+    return "".join(out)
+
+
+def extract_plate_details(pil_image):
+    if cv2 is None:
+        return {"status": "error", "message": f"OpenCV failed to import: {cv2_import_error}"}
+
+    model = get_devanagari_model()
+    if model is None:
+        return {"status": "error", "message": f"MallaNet load failed: {_MODEL_ERROR}"}
+
+    rgb = np.array(pil_image.convert("RGB"))
+    h, w = rgb.shape[:2]
+    if max(h, w) > 1280:
+        scale = 1280.0 / max(h, w)
+        rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    plate_rgb, _ = _auto_crop_plate(rgb)
+    gray = cv2.cvtColor(plate_rgb, cv2.COLOR_RGB2GRAY)
+    boxes = _select_best_boxes(gray)
+    rows = _group_rows(boxes)
+    if not rows:
+        return {"status": "error", "message": "No characters detected. Use a closer/cropped plate image."}
+
+    plate_h, plate_w = gray.shape[:2]
+    row_texts = []
+    confs = []
+    for row in rows:
+        chars = []
+        for x, y, bw, bh in row:
+            pad = max(2, int(0.08 * max(bw, bh)))
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(plate_w, x + bw + pad)
+            y2 = min(plate_h, y + bh + pad)
+            patch = gray[y1:y2, x1:x2]
+            ch, conf = _predict_char(patch)
+            chars.append(ch)
+            confs.append(conf)
+        row_texts.append("".join(chars))
+
+    plate_text = "".join(row_texts)
+    return {
+        "status": "ok",
+        "plate_text": plate_text,
+        "digits_ascii": _ascii_digits_only(plate_text),
+        "avg_conf": float(np.mean(confs)) if confs else 0.0,
+    }
+
+
+def predict_single(image):
     if image is None:
-        return '⚠️ Please upload an image first.'
-    if not selected_models:
-        return '⚠️ Please select at least one model.'
+        return "Please upload an image."
+    result = extract_plate_details(image)
+    try:
+        if result["status"] != "ok":
+            return result["message"]
+        return (
+            f"Plate text: {result['plate_text']}\n"
+            f"Digits (ASCII): {result['digits_ascii'] or '(none)'}\n"
+            f"Avg confidence: {result['avg_conf']:.3f}"
+        )
+    finally:
+        unload_model()
 
-    outputs = []
-    for model_name in selected_models:
-        func = AVAILABLE_MODELS.get(model_name)
-        if not func:
-            outputs.append(f"### {model_name}\n\n(Model not found)\n\n---\n")
-            continue
+
+def _coerce_path(file_obj):
+    if isinstance(file_obj, str):
+        return file_obj
+    if isinstance(file_obj, dict) and "name" in file_obj:
+        return file_obj["name"]
+    if hasattr(file_obj, "name"):
+        return file_obj.name
+    return str(file_obj)
+
+
+def predict_batch(files):
+    if not files:
+        return "Please upload one or more images.", []
+    if not isinstance(files, list):
+        files = [files]
+
+    rows = []
+    success = 0
+    for idx, fobj in enumerate(files[:10], start=1):
+        path = _coerce_path(fobj)
+        name = Path(path).name if path else f"image_{idx}"
         try:
-            text = func(image)
-        except Exception as e:
-            text = f'Error: {e}'
-        outputs.append(f"### {model_name}\n\n{text}\n\n---\n")
+            with Image.open(path) as img:
+                result = extract_plate_details(img.convert("RGB"))
+        except Exception as err:
+            rows.append([name, "-", "-", "0.000", f"Error: {err}"])
+            continue
 
-    return '\n'.join(outputs)
+        if result["status"] == "ok":
+            success += 1
+            rows.append(
+                [
+                    name,
+                    result["plate_text"] if result["plate_text"] else "-",
+                    result["digits_ascii"] if result["digits_ascii"] else "-",
+                    f"{result['avg_conf']:.3f}",
+                    "OK",
+                ]
+            )
+        else:
+            rows.append([name, "-", "-", "0.000", result["message"]])
 
-# ---------------------------------------------------------
-# GRADIO UI
-# ---------------------------------------------------------
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    summary = f"Processed {len(rows)} image(s). Successful reads: {success}/{len(rows)}."
+    unload_model()
+    return summary, rows
+
 
 def create_app():
-    with gr.Blocks(title='OCR Model Comparator') as demo:
-        gr.Markdown('''
-            # OCR Model Comparator
-            Upload an image containing text, select the models/libraries to use, and compare extracted text in one screen.
-        ''')
+    with gr.Blocks(title="Lightweight Nepali License Plate OCR") as demo:
+        gr.Markdown(
+            """
+            # Lightweight Nepali License Plate OCR
+            This build is optimized to reduce crashes: it only loads the plate OCR model when you click extract.
+            """
+        )
 
         with gr.Row():
             with gr.Column(scale=1):
-                image_input = gr.Image(type='pil', label='Input Image')
-                model_checkboxes = gr.CheckboxGroup(
-                    choices=list(AVAILABLE_MODELS.keys()),
-                    label='Select Models for Extraction',
-                    value=list(AVAILABLE_MODELS.keys())[:2]
+                image_input = gr.Image(type="pil", label="Single Plate Image")
+                single_btn = gr.Button("Extract Single Plate", variant="primary")
+                file_input = gr.File(
+                    file_count="multiple",
+                    file_types=["image"],
+                    type="filepath",
+                    label="Batch Upload (up to 10 images)",
                 )
-                submit_btn = gr.Button('Extract Text', variant='primary')
+                batch_btn = gr.Button("Extract Batch Plates", variant="primary")
 
             with gr.Column(scale=1):
-                output_display = gr.Markdown(label='Extraction Results')
+                single_output = gr.Markdown(label="Single Result")
+                batch_summary = gr.Markdown()
+                batch_table = gr.Dataframe(
+                    headers=["Image", "Plate Text", "Digits (ASCII)", "Avg Confidence", "Status"],
+                    datatype=["str", "str", "str", "str", "str"],
+                    interactive=False,
+                )
 
-        submit_btn.click(fn=process_extraction, inputs=[image_input, model_checkboxes], outputs=[output_display])
+        single_btn.click(fn=predict_single, inputs=[image_input], outputs=[single_output])
+        batch_btn.click(fn=predict_batch, inputs=[file_input], outputs=[batch_summary, batch_table])
 
     return demo
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = create_app()
-    app.launch(share=False)
-
+    app.launch(share=False, show_error=True)
