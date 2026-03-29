@@ -429,9 +429,16 @@ def extract_plate_details(pil_image):
     plate_h, plate_w = gray.shape[:2]
     row_texts = []
     confs = []
+    
+    # Debug image
+    debug_img = plate_rgb.copy()
+    
     for row in rows:
         chars = []
         for x, y, bw, bh in row:
+            # Draw bounding box for visualization
+            cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            
             pad = max(2, int(0.08 * max(bw, bh)))
             x1 = max(0, x - pad)
             y1 = max(0, y - pad)
@@ -439,6 +446,12 @@ def extract_plate_details(pil_image):
             y2 = min(plate_h, y + bh + pad)
             patch = gray[y1:y2, x1:x2]
             ch, conf = _predict_char(patch)
+            
+            # Put predicted text
+            if ch != "?":
+                # using basic ascii for cv2 putText if possible, or just the conf
+                cv2.putText(debug_img, f"{conf:.2f}", (x, max(10, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+
             chars.append(ch)
             confs.append(conf)
         row_texts.append("".join(chars))
@@ -449,21 +462,23 @@ def extract_plate_details(pil_image):
         "plate_text": plate_text,
         "digits_ascii": _ascii_digits_only(plate_text),
         "avg_conf": float(np.mean(confs)) if confs else 0.0,
+        "debug_img": Image.fromarray(debug_img)
     }
 
 
 def predict_single(image):
     if image is None:
-        return "Please upload an image."
+        return "Please upload an image.", None
     result = extract_plate_details(image)
     try:
         if result["status"] != "ok":
-            return result["message"]
-        return (
-            f"Plate text: {result['plate_text']}\n"
-            f"Digits (ASCII): {result['digits_ascii'] or '(none)'}\n"
-            f"Avg confidence: {result['avg_conf']:.3f}"
+            return result["message"], None
+        markdown_res = (
+            f"**Plate text:** {result['plate_text']}\n\n"
+            f"**Digits (ASCII):** {result['digits_ascii'] or '(none)'}\n\n"
+            f"**Avg confidence:** {result['avg_conf']:.3f}"
         )
+        return markdown_res, result.get("debug_img")
     finally:
         unload_model()
 
@@ -542,6 +557,7 @@ def create_app():
 
             with gr.Column(scale=1):
                 single_output = gr.Markdown(label="Single Result")
+                single_debug_image = gr.Image(type="pil", label="Debug: OpenCV Character Extraction")
                 batch_summary = gr.Markdown()
                 batch_table = gr.Dataframe(
                     headers=["Image", "Plate Text", "Digits (ASCII)", "Avg Confidence", "Status"],
@@ -549,7 +565,7 @@ def create_app():
                     interactive=False,
                 )
 
-        single_btn.click(fn=predict_single, inputs=[image_input], outputs=[single_output])
+        single_btn.click(fn=predict_single, inputs=[image_input], outputs=[single_output, single_debug_image])
         batch_btn.click(fn=predict_batch, inputs=[file_input], outputs=[batch_summary, batch_table])
 
     return demo
