@@ -1,5 +1,8 @@
 import gc
 import os
+import sys
+import base64
+from io import BytesIO
 from pathlib import Path
 
 import gradio as gr
@@ -24,6 +27,36 @@ torch.set_num_threads(max(1, min(2, os.cpu_count() or 2)))
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CHECKPOINT_PATH = ROOT / "MallaNet" / "models" / "best_model.pth"
+
+TRAIFIC_APP_DIR = ROOT / "TraificNPR" / "application"
+if str(TRAIFIC_APP_DIR) not in sys.path:
+    sys.path.append(str(TRAIFIC_APP_DIR))
+
+try:
+    from model_loader import load_models as load_traific_models
+    from image_processing import process_frame as process_traific_frame
+    TRAIFIC_AVAILABLE = True
+    TRAIFIC_ERROR = None
+except ImportError as e:
+    TRAIFIC_AVAILABLE = False
+    TRAIFIC_ERROR = str(e)
+
+_TRAIFIC_MODELS = None
+def get_traific_models():
+    global _TRAIFIC_MODELS
+    if _TRAIFIC_MODELS is None:
+        if not TRAIFIC_AVAILABLE:
+            raise RuntimeError(f"TraificNPR failed to import: {TRAIFIC_ERROR}")
+        _TRAIFIC_MODELS = load_traific_models()
+    return _TRAIFIC_MODELS
+
+def unload_traific_models():
+    global _TRAIFIC_MODELS
+    if _TRAIFIC_MODELS is not None:
+        _TRAIFIC_MODELS = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------
@@ -412,31 +445,54 @@ def extract_plate_details(pil_image):
     model = get_devanagari_model()
     if model is None:
         return {"status": "error", "message": f"MallaNet load failed: {_MODEL_ERROR}"}
+        
+    try:
+        traific_models = get_traific_models()
+        plate_model, seg_model, _, _, _ = traific_models
+    except Exception as e:
+        return {"status": "error", "message": f"Could not load YOLO models for segmentation: {str(e)}"}
 
-    rgb = np.array(pil_image.convert("RGB"))
-    h, w = rgb.shape[:2]
+    cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    h, w = cv_image.shape[:2]
     if max(h, w) > 1280:
         scale = 1280.0 / max(h, w)
-        rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        cv_image = cv2.resize(cv_image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        h, w = cv_image.shape[:2]
 
-    plate_rgb, _ = _auto_crop_plate(rgb)
-    gray = cv2.cvtColor(plate_rgb, cv2.COLOR_RGB2GRAY)
-    boxes = _select_best_boxes(gray)
+    # 1. YOLO Plate Detection (fallback to full image)
+    plate_results = plate_model.predict(cv_image, verbose=False, conf=0.15)
+    if not plate_results or not len(plate_results[0].boxes):
+        plate_img = cv_image
+    else:
+        x1, y1, x2, y2 = map(int, plate_results[0].boxes[0].xyxy[0].tolist())
+        plate_img = cv_image[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+
+    # 2. YOLO Char Segmentation
+    seg_results = seg_model.predict(plate_img, verbose=False, conf=0.15)
+    if not seg_results or not len(seg_results[0].boxes):
+        return {"status": "error", "message": "No characters detected by YOLO Segmenter."}
+
+    boxes = []
+    for box in seg_results[0].boxes:
+        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+        boxes.append((bx1, by1, bx2 - bx1, by2 - by1))
+
     rows = _group_rows(boxes)
     if not rows:
-        return {"status": "error", "message": "No characters detected. Use a closer/cropped plate image."}
+        return {"status": "error", "message": "Could not group YOLO detected characters."}
 
-    plate_h, plate_w = gray.shape[:2]
+    plate_h, plate_w = plate_img.shape[:2]
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    
     row_texts = []
     confs = []
     
-    # Debug image
-    debug_img = plate_rgb.copy()
+    # Debug image (RGB for rendering)
+    debug_img = cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB)
     
     for row in rows:
         chars = []
         for x, y, bw, bh in row:
-            # Draw bounding box for visualization
             cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             
             pad = max(2, int(0.08 * max(bw, bh)))
@@ -447,9 +503,7 @@ def extract_plate_details(pil_image):
             patch = gray[y1:y2, x1:x2]
             ch, conf = _predict_char(patch)
             
-            # Put predicted text
             if ch != "?":
-                # using basic ascii for cv2 putText if possible, or just the conf
                 cv2.putText(debug_img, f"{conf:.2f}", (x, max(10, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
 
             chars.append(ch)
@@ -465,11 +519,65 @@ def extract_plate_details(pil_image):
         "debug_img": Image.fromarray(debug_img)
     }
 
+def extract_traific_details(pil_image):
+    try:
+        models = get_traific_models()
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-def predict_single(image):
+    plate_model, seg_model, recog_model, device, ocr_font = models
+    
+    cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    
+    results = process_traific_frame(
+        frame=cv_image, 
+        frame_number=0, 
+        filename_prefix="gradio_upload",
+        plate_model=plate_model,
+        seg_model=seg_model,
+        recog_model=recog_model,
+        device=device,
+        ocr_font=ocr_font
+    )
+    
+    if not results:
+        return {"status": "error", "message": "TraificNPR could not process plates in this image."}
+    
+    best_res = results[0]
+    if 'error' in best_res:
+        return {"status": "error", "message": best_res['error']}
+
+    plate_text = best_res.get('final_text', '')
+    conf = best_res.get('confidence', 0.0)
+    
+    debug_pil_img = pil_image.copy()
+    if 'deskewed_plate' in best_res and best_res['deskewed_plate']:
+        try:
+            b64_data = best_res['deskewed_plate']
+            if "," in b64_data:
+                b64_data = b64_data.split(",")[1]
+            img_data = base64.b64decode(b64_data)
+            debug_pil_img = Image.open(BytesIO(img_data)).convert("RGB")
+        except Exception as e:
+            pass
+
+    return {
+        "status": "ok",
+        "plate_text": plate_text,
+        "digits_ascii": _ascii_digits_only(plate_text),
+        "avg_conf": conf,
+        "debug_img": debug_pil_img
+    }
+
+def predict_single(image, model_choice="MallaNet"):
     if image is None:
         return "Please upload an image.", None
-    result = extract_plate_details(image)
+    
+    if model_choice == "TraificNPR (YOLO + CNN)":
+        result = extract_traific_details(image)
+    else:
+        result = extract_plate_details(image)
+        
     try:
         if result["status"] != "ok":
             return result["message"], None
@@ -480,7 +588,10 @@ def predict_single(image):
         )
         return markdown_res, result.get("debug_img")
     finally:
-        unload_model()
+        if model_choice == "TraificNPR (YOLO + CNN)":
+            unload_traific_models()
+        else:
+            unload_model()
 
 
 def _coerce_path(file_obj):
@@ -493,7 +604,7 @@ def _coerce_path(file_obj):
     return str(file_obj)
 
 
-def predict_batch(files):
+def predict_batch(files, model_choice="MallaNet"):
     if not files:
         return "Please upload one or more images.", []
     if not isinstance(files, list):
@@ -506,7 +617,10 @@ def predict_batch(files):
         name = Path(path).name if path else f"image_{idx}"
         try:
             with Image.open(path) as img:
-                result = extract_plate_details(img.convert("RGB"))
+                if model_choice == "TraificNPR (YOLO + CNN)":
+                    result = extract_traific_details(img.convert("RGB"))
+                else:
+                    result = extract_plate_details(img.convert("RGB"))
         except Exception as err:
             rows.append([name, "-", "-", "0.000", f"Error: {err}"])
             continue
@@ -530,7 +644,10 @@ def predict_batch(files):
             torch.cuda.empty_cache()
 
     summary = f"Processed {len(rows)} image(s). Successful reads: {success}/{len(rows)}."
-    unload_model()
+    if model_choice == "TraificNPR (YOLO + CNN)":
+        unload_traific_models()
+    else:
+        unload_model()
     return summary, rows
 
 
@@ -545,6 +662,11 @@ def create_app():
 
         with gr.Row():
             with gr.Column(scale=1):
+                model_choice = gr.Radio(
+                    choices=["MallaNet (Custom CNN + OpenCV)", "TraificNPR (YOLO + CNN)"],
+                    value="MallaNet (Custom CNN + OpenCV)",
+                    label="OCR Pipeline Engine (Choose Engine on the fly)"
+                )
                 image_input = gr.Image(type="pil", label="Single Plate Image")
                 single_btn = gr.Button("Extract Single Plate", variant="primary")
                 file_input = gr.File(
@@ -557,7 +679,7 @@ def create_app():
 
             with gr.Column(scale=1):
                 single_output = gr.Markdown(label="Single Result")
-                single_debug_image = gr.Image(type="pil", label="Debug: OpenCV Character Extraction")
+                single_debug_image = gr.Image(type="pil", label="Debug / Crop Image")
                 batch_summary = gr.Markdown()
                 batch_table = gr.Dataframe(
                     headers=["Image", "Plate Text", "Digits (ASCII)", "Avg Confidence", "Status"],
@@ -565,8 +687,8 @@ def create_app():
                     interactive=False,
                 )
 
-        single_btn.click(fn=predict_single, inputs=[image_input], outputs=[single_output, single_debug_image])
-        batch_btn.click(fn=predict_batch, inputs=[file_input], outputs=[batch_summary, batch_table])
+        single_btn.click(fn=predict_single, inputs=[image_input, model_choice], outputs=[single_output, single_debug_image])
+        batch_btn.click(fn=predict_batch, inputs=[file_input, model_choice], outputs=[batch_summary, batch_table])
 
     return demo
 
