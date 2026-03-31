@@ -5,7 +5,7 @@ import base64
 from io import BytesIO
 from pathlib import Path
 
-import gradio as gr
+from flask import Flask, request, jsonify, render_template
 import numpy as np
 import torch
 import torch.nn as nn
@@ -569,130 +569,69 @@ def extract_traific_details(pil_image):
         "debug_img": debug_pil_img
     }
 
-def predict_single(image, model_choice="MallaNet"):
-    if image is None:
-        return "Please upload an image.", None
-    
-    if model_choice == "TraificNPR (YOLO + CNN)":
-        result = extract_traific_details(image)
-    else:
-        result = extract_plate_details(image)
+# ==============================================================================
+# FLASK APPLICATION EXPOSURE
+# ==============================================================================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/extract', methods=['POST'])
+def api_extract():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
         
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+
+    engine_choice = request.form.get('engine', 'malla')
+    
     try:
-        if result["status"] != "ok":
-            return result["message"], None
-        markdown_res = (
-            f"**Plate text:** {result['plate_text']}\n\n"
-            f"**Digits (ASCII):** {result['digits_ascii'] or '(none)'}\n\n"
-            f"**Avg confidence:** {result['avg_conf']:.3f}"
-        )
-        return markdown_res, result.get("debug_img")
+        pil_image = Image.open(file.stream).convert('RGB')
+        
+        if engine_choice == 'traific':
+            result = extract_traific_details(pil_image)
+        else:
+            result = extract_plate_details(pil_image)
+
+        if result['status'] != 'ok':
+            return jsonify({"error": result['message']}), 400
+            
+        # Convert the debug image to base64 for the frontend
+        debug_pil = result.get('debug_img')
+        debug_b64 = None
+        if debug_pil:
+            buffered = BytesIO()
+            debug_pil.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            debug_b64 = f"data:image/jpeg;base64,{img_str}"
+        
+        response_data = {
+            "status": "ok",
+            "plate_text": result['plate_text'],
+            "digits_ascii": result['digits_ascii'],
+            "avg_conf": round(result['avg_conf'], 4),
+            "debug_img": debug_b64
+        }
+        return jsonify(response_data)
+        
+    except Exception as e:
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
     finally:
-        if model_choice == "TraificNPR (YOLO + CNN)":
+        # Free memory aggressively after each request
+        if engine_choice == 'traific':
             unload_traific_models()
         else:
             unload_model()
-
-
-def _coerce_path(file_obj):
-    if isinstance(file_obj, str):
-        return file_obj
-    if isinstance(file_obj, dict) and "name" in file_obj:
-        return file_obj["name"]
-    if hasattr(file_obj, "name"):
-        return file_obj.name
-    return str(file_obj)
-
-
-def predict_batch(files, model_choice="MallaNet"):
-    if not files:
-        return "Please upload one or more images.", []
-    if not isinstance(files, list):
-        files = [files]
-
-    rows = []
-    success = 0
-    for idx, fobj in enumerate(files[:10], start=1):
-        path = _coerce_path(fobj)
-        name = Path(path).name if path else f"image_{idx}"
-        try:
-            with Image.open(path) as img:
-                if model_choice == "TraificNPR (YOLO + CNN)":
-                    result = extract_traific_details(img.convert("RGB"))
-                else:
-                    result = extract_plate_details(img.convert("RGB"))
-        except Exception as err:
-            rows.append([name, "-", "-", "0.000", f"Error: {err}"])
-            continue
-
-        if result["status"] == "ok":
-            success += 1
-            rows.append(
-                [
-                    name,
-                    result["plate_text"] if result["plate_text"] else "-",
-                    result["digits_ascii"] if result["digits_ascii"] else "-",
-                    f"{result['avg_conf']:.3f}",
-                    "OK",
-                ]
-            )
-        else:
-            rows.append([name, "-", "-", "0.000", result["message"]])
-
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    summary = f"Processed {len(rows)} image(s). Successful reads: {success}/{len(rows)}."
-    if model_choice == "TraificNPR (YOLO + CNN)":
-        unload_traific_models()
-    else:
-        unload_model()
-    return summary, rows
-
-
-def create_app():
-    with gr.Blocks(title="Lightweight Nepali License Plate OCR") as demo:
-        gr.Markdown(
-            """
-            # Lightweight Nepali License Plate OCR
-            This build is optimized to reduce crashes: it only loads the plate OCR model when you click extract.
-            """
-        )
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                model_choice = gr.Radio(
-                    choices=["MallaNet (Custom CNN + OpenCV)", "TraificNPR (YOLO + CNN)"],
-                    value="MallaNet (Custom CNN + OpenCV)",
-                    label="OCR Pipeline Engine (Choose Engine on the fly)"
-                )
-                image_input = gr.Image(type="pil", label="Single Plate Image")
-                single_btn = gr.Button("Extract Single Plate", variant="primary")
-                file_input = gr.File(
-                    file_count="multiple",
-                    file_types=["image"],
-                    type="filepath",
-                    label="Batch Upload (up to 10 images)",
-                )
-                batch_btn = gr.Button("Extract Batch Plates", variant="primary")
-
-            with gr.Column(scale=1):
-                single_output = gr.Markdown(label="Single Result")
-                single_debug_image = gr.Image(type="pil", label="Debug / Crop Image")
-                batch_summary = gr.Markdown()
-                batch_table = gr.Dataframe(
-                    headers=["Image", "Plate Text", "Digits (ASCII)", "Avg Confidence", "Status"],
-                    datatype=["str", "str", "str", "str", "str"],
-                    interactive=False,
-                )
-
-        single_btn.click(fn=predict_single, inputs=[image_input, model_choice], outputs=[single_output, single_debug_image])
-        batch_btn.click(fn=predict_batch, inputs=[file_input, model_choice], outputs=[batch_summary, batch_table])
-
-    return demo
-
-
-if __name__ == "__main__":
-    app = create_app()
-    app.launch(share=False, show_error=True)
+if __name__ == '__main__':
+    # Make sure templates folder exists relative to app.py
+    template_dir = Path(__file__).parent / 'templates'
+    template_dir.mkdir(exist_ok=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
