@@ -37,5 +37,5 @@ echo "[INFO] Checking and installing dependencies from requirements.txt..."
 pip install -r requirements.txt
 
 # Run the app
-echo "[INFO] Starting Gradio App..."
-python3 src/gradio_app.py
+echo "[INFO] Starting Flask App..."
+python3 src/app.py

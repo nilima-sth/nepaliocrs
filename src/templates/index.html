@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nepali ANPR Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800">
+    <nav class="bg-blue-600 text-white shadow-md w-full">
+        <div class="max-w-6xl mx-auto px-4 py-4 font-bold text-xl tracking-wide flex justify-between items-center">
+            <div>VisionOCR // Nepali License Plates</div>
+            <div class="text-sm font-normal text-blue-200">Diagnostics Mode</div>
+        </div>
+    </nav>
+    
+    <main class="max-w-6xl mx-auto py-10 px-4 grid grid-cols-1 md:grid-cols-2 gap-8">
+        <!-- Upload Panel -->
+        <div class="bg-white rounded-xl shadow-sm p-6 border border-slate-200 h-fit">
+            <h2 class="text-lg font-semibold border-b pb-2 mb-4">Inspection Panel</h2>
+            <form id="uploadForm" class="space-y-6">
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">OCR Pipeline Engine</label>
+                    <select name="engine" class="w-full border-slate-300 rounded-md shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500">
+                        <option value="traific">TraificNPR (YOLO + CNN) - Recommended</option>
+                        <option value="malla">Malla Hybrid (YOLO Seg + Malla CNN)</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Target Image</label>
+                    <div class="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-slate-300 border-dashed rounded-md hover:bg-slate-50 transition cursor-pointer" onclick="document.getElementById('fileInput').click()">
+                        <div class="space-y-1 text-center">
+                            <svg class="mx-auto h-12 w-12 text-slate-400" stroke="currentColor" fill="none" viewBox="0 0 48 48" aria-hidden="true">
+                                <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                            </svg>
+                            <div class="flex text-sm text-slate-600 justify-center">
+                                <label class="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none">
+                                    <span>Upload an Image</span>
+                                    <input id="fileInput" name="file" type="file" class="sr-only" accept="image/*" onchange="previewImage(event)">
+                                </label>
+                            </div>
+                            <p class="text-xs text-slate-500">PNG, JPG, WEBP</p>
+                        </div>
+                    </div>
+                    <div class="mt-4 hidden" id="previewContainer">
+                        <img id="imgPreview" class="max-h-48 mx-auto rounded-lg shadow-sm border" />
+                    </div>
+                </div>
+
+                <button type="submit" id="submitBtn" class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition">
+                    Run Extraction
+                </button>
+            </form>
+        </div>
+
+        <!-- Result Panel -->
+        <div class="bg-white rounded-xl shadow-sm p-6 border border-slate-200">
+            <h2 class="text-lg font-semibold border-b pb-2 mb-4">Results</h2>
+            
+            <div id="loader" class="hidden flex flex-col items-center justify-center py-12">
+                <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600 mb-4"></div>
+                <p class="text-slate-500">Processing image through neural network...</p>
+            </div>
+
+            <div id="emptyState" class="flex flex-col items-center justify-center py-12 text-slate-400">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mb-2 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <p>Run extraction to see results</p>
+            </div>
+
+            <div id="errorBox" class="hidden mt-4 p-4 bg-red-50 text-red-700 rounded-md border border-red-200"></div>
+
+            <div id="resultBox" class="hidden space-y-6 pt-2">
+                <div>
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest">Plate Text</span>
+                    <div id="resText" class="mt-1 text-4xl font-bold text-slate-800 tracking-wider"></div>
+                </div>
+                <div>
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest">ASCII Digits</span>
+                    <div id="resDigits" class="mt-1 font-mono text-xl text-slate-700 bg-slate-50 p-3 rounded-md border border-slate-200"></div>
+                </div>
+                <div>
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest">Pipeline Confidence</span>
+                    <div class="mt-2 flex items-center">
+                        <div class="w-full bg-slate-200 rounded-full h-3 flex-1 overflow-hidden relative">
+                            <div id="resConfBar" class="bg-green-500 h-3 rounded-full transition-all duration-1000 ease-out" style="width: 0%"></div>
+                        </div>
+                        <span id="resConfText" class="ml-4 text-sm font-bold text-slate-700 w-12 text-right">0%</span>
+                    </div>
+                </div>
+                <div class="pt-4 border-t">
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3 block">Vision Debug Crop</span>
+                    <img id="resDebugImg" class="rounded-lg shadow-md border mx-auto max-h-48" />
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function previewImage(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    document.getElementById('imgPreview').src = e.target.result;
+                    document.getElementById('previewContainer').classList.remove('hidden');
+                }
+                reader.readAsDataURL(file);
+            }
+        }
+
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fileInput = document.getElementById('fileInput');
+            if(!fileInput.files[0]) {
+                alert('Please select an image first.');
+                return;
+            }
+
+            formProcessing(true);
+            
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            formData.append('engine', document.querySelector('[name="engine"]').value);
+
+            try {
+                const res = await fetch('/api/extract', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await res.json();
+                
+                if(!res.ok || data.error) {
+                    showError(data.error || 'Unknown error occurred');
+                } else {
+                    showResult(data);
+                }
+            } catch(err) {
+                showError(err.message);
+            } finally {
+                formProcessing(false);
+            }
+        });
+
+        function formProcessing(isProcessing) {
+            document.getElementById('submitBtn').disabled = isProcessing;
+            document.getElementById('submitBtn').innerText = isProcessing ? 'Extracting...' : 'Run Extraction';
+            
+            document.getElementById('emptyState').classList.add('hidden');
+
+            if(isProcessing) {
+                document.getElementById('loader').classList.remove('hidden');
+                document.getElementById('errorBox').classList.add('hidden');
+                document.getElementById('resultBox').classList.add('hidden');
+                document.getElementById('resConfBar').style.width = '0%';
+            } else {
+                document.getElementById('loader').classList.add('hidden');
+            }
+        }
+
+        function showError(msg) {
+            const box = document.getElementById('errorBox');
+            box.innerText = msg;
+            box.classList.remove('hidden');
+        }
+
+        function showResult(data) {
+            document.getElementById('resText').innerText = data.plate_text || 'None';
+            document.getElementById('resDigits').innerText = data.digits_ascii || '-';
+            
+            const confVal = parseFloat(data.avg_conf);
+            const confPercent = Math.round(confVal * 100);
+            
+            const bar = document.getElementById('resConfBar');
+            bar.style.width = `${confPercent}%`;
+            
+            if (confPercent > 80) bar.className = 'bg-green-500 h-3 rounded-full transition-all duration-1000 ease-out';
+            else if (confPercent > 60) bar.className = 'bg-yellow-500 h-3 rounded-full transition-all duration-1000 ease-out';
+            else bar.className = 'bg-red-500 h-3 rounded-full transition-all duration-1000 ease-out';
+
+            document.getElementById('resConfText').innerText = `${confPercent}%`;
+            
+            if(data.debug_img) {
+                document.getElementById('resDebugImg').src = data.debug_img;
+                document.getElementById('resDebugImg').classList.remove('hidden');
+            } else {
+                document.getElementById('resDebugImg').classList.add('hidden');
+            }
+            
+            document.getElementById('resultBox').classList.remove('hidden');
+        }
+    </script>
+</body>
+</html>
