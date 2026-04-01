@@ -1,9 +1,6 @@
 #!/bin/bash
 set -e
 
-echo "==================================================="
-echo "  Nepali License Plate OCR App Initialization"
-echo "==================================================="
 
 # Change to the directory of the script
 cd "$(dirname "$0")"
@@ -30,12 +27,12 @@ source .venv/bin/activate
 
 # Upgrade pip and install wheel/numpy first for safe compilation
 echo "[INFO] Ensuring base packaging tools are installed..."
-python3 -m pip install --upgrade pip wheel numpy
+.venv/bin/python3 -m pip install --upgrade pip wheel numpy
 
 # Install requirements
 echo "[INFO] Checking and installing dependencies from requirements.txt..."
-pip install -r requirements.txt
+.venv/bin/pip3 install -r requirements.txt
 
 # Run the app
 echo "[INFO] Starting Flask App..."
-python3 src/app.py
+.venv/bin/python3 src/app.py
