@@ -598,7 +598,9 @@ def api_extract():
             result = extract_plate_details(pil_image)
 
         if result['status'] != 'ok':
-            return jsonify({"error": result['message']}), 400
+            # Return 200 OK so the browser console doesn't show scary red errors,
+            # but keep the JSON error format so the frontend can display it cleanly.
+            return jsonify({"error": result['message']}), 200
             
         # Convert the debug image to base64 for the frontend
         debug_pil = result.get('debug_img')

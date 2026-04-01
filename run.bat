@@ -1,10 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo ===================================================
-echo   Nepali License Plate OCR App Initialization
-echo ===================================================
-
 cd /d "%~dp0"
 
 :: Check if Python is available
@@ -32,14 +28,14 @@ call .\.venv\Scripts\activate.bat
 
 :: Upgrade pip and install wheel/numpy first for safe compilation
 echo [INFO] Ensuring base packaging tools are installed...
-python -m pip install --upgrade pip wheel numpy >nul 2>&1
+".\.venv\Scripts\python.exe" -m pip install --upgrade pip wheel numpy >nul 2>&1
 
 :: Install requirements if not fully met
 echo [INFO] Checking and installing dependencies from requirements.txt...
-pip install -r requirements.txt
+".\.venv\Scripts\pip.exe" install -r requirements.txt
 
 :: Run the app
 echo [INFO] Starting Flask App...
-python src\app.py
+".\.venv\Scripts\python.exe" src\app.py
 
 pause
