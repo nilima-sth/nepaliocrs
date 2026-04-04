@@ -1,5 +1,7 @@
 import os
+import subprocess
 from huggingface_hub import snapshot_download
+
 
 def download_models():
     base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models')
@@ -17,7 +19,6 @@ def download_models():
     indic_path = os.path.join(base_dir, 'Indic-HTR-CVIP-2024')
     if not os.path.exists(indic_path):
         print("[INFO] Cloning LalithaEvani/Indic-HTR-CVIP-2024 from GitHub...")
-        import subprocess
         try:
             subprocess.run(["git", "clone", "https://github.com/LalithaEvani/Indic-HTR-CVIP-2024.git", indic_path], check=True)
             print("[INFO] Indic-HTR GitHub repository cloned successfully.")
@@ -25,6 +26,33 @@ def download_models():
             print(f"[ERROR] Failed to clone Indic-HTR repository: {e}")
     else:
         print("[INFO] Indic-HTR already exists. Skipping.")
+
+    print("\n[INFO] Downloading TrOCR Devanagari model...")
+    trocr_path = os.path.join(base_dir, 'trocr-devanagari-2')
+    if not os.path.exists(trocr_path):
+        try:
+            snapshot_download(repo_id="paudelanil/trocr-devanagari-2", local_dir=trocr_path)
+            print("[INFO] TrOCR model downloaded successfully.")
+        except Exception as e:
+            print(f"[WARNING] Failed to download TrOCR model: {e}")
+    else:
+        print("[INFO] TrOCR model already exists. Skipping.")
+
+    print("\n[INFO] Ensuring DBNet repository exists...")
+    dbnet_path = os.path.join(base_dir, 'Nepali-Text-Detection-DBnet')
+    if not os.path.exists(dbnet_path):
+        try:
+            subprocess.run(
+                ["git", "clone", "https://github.com/R4j4n/Nepali-Text-Detection-DBnet.git", dbnet_path],
+                check=True,
+            )
+            print("[INFO] DBNet repository cloned successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"[WARNING] Failed to clone DBNet repository: {e}")
+    else:
+        print("[INFO] DBNet repository already exists. Skipping.")
+
+    print("\n[NOTE] DBNet and Indic-HTR still require trained checkpoints (.pth/.ckpt) for real inference.")
 
 if __name__ == "__main__":
     download_models()

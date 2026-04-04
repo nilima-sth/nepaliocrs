@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 from torchvision import transforms
 from document_ocr import proprietary_document_pipeline
+from ocr_engines import TrOCREngine
 
 cv2 = None
 cv2_import_error = None
@@ -51,6 +52,7 @@ MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("OCR_MAX_CONCURRENT_REQUESTS", "1
 UNLOAD_MODELS_EACH_REQUEST = _env_flag("OCR_UNLOAD_MODELS_EACH_REQUEST", "0")
 ENABLE_PADDLE_FALLBACK = _env_flag("OCR_ENABLE_PADDLE_FALLBACK", "0")
 ENABLE_TRAIFIC_ENGINE = _env_flag("OCR_ENABLE_TRAIFIC_ENGINE", "0")
+TROCR_MODEL_ID = os.getenv("TROCR_MODEL_ID", "paudelanil/trocr-devanagari-2")
 INFERENCE_SEMAPHORE = BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
 TRAIFIC_APP_DIR = ROOT / "TraificNPR" / "application"
@@ -833,11 +835,13 @@ def _run_ocr(engine_choice, pil_image):
 
     if engine == 'paddle':
         return extract_paddle_details(pil_image)
+    if engine == 'trocr':
+        return extract_trocr_details(pil_image)
     if engine in {'indic', 'malla'}:
         return proprietary_document_pipeline(pil_image)
     if engine == 'kaggle':
         return extract_kaggle_details(pil_image)
-    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'indic', or 'kaggle'."}
+    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'trocr', 'indic', or 'kaggle'."}
 
 @app.route('/')
 def index():
@@ -903,8 +907,8 @@ def api_extract_v1():
         return jsonify({"error": "Empty filename"}), 400
 
     engine_choice = request.form.get('engine', 'paddle')
-    if engine_choice not in {'paddle', 'indic', 'kaggle', 'malla'}:
-        return jsonify({"error": "Invalid engine. Use 'paddle', 'indic', or 'kaggle'."}), 400
+    if engine_choice not in {'paddle', 'trocr', 'indic', 'kaggle', 'malla'}:
+        return jsonify({"error": "Invalid engine. Use 'paddle', 'trocr', 'indic', or 'kaggle'."}), 400
 
     include_debug = request.form.get('include_debug', 'false').lower() in {'1', 'true', 'yes'}
     acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
@@ -944,6 +948,36 @@ def api_extract_v1():
 
 _PADDLE_OCR = None
 _PADDLE_OCR_LOCK = Lock()
+_TROCR_ENGINE = None
+_TROCR_ENGINE_LOCK = Lock()
+
+
+def get_trocr_engine():
+    global _TROCR_ENGINE
+    if _TROCR_ENGINE is not None:
+        return _TROCR_ENGINE
+
+    with _TROCR_ENGINE_LOCK:
+        if _TROCR_ENGINE is not None:
+            return _TROCR_ENGINE
+        _TROCR_ENGINE = TrOCREngine(model_id=TROCR_MODEL_ID)
+        return _TROCR_ENGINE
+
+
+def extract_trocr_details(pil_image):
+    try:
+        engine = get_trocr_engine()
+        result = engine.predict(pil_image)
+        if result.status != 'ok':
+            return {'status': 'error', 'message': result.error or 'TrOCR inference failed'}
+        return {
+            'status': 'ok',
+            'extracted_text': result.text,
+            'avg_conf': float(result.conf),
+            'debug_img': result.debug_img or pil_image,
+        }
+    except Exception as err:
+        return {'status': 'error', 'message': f'TrOCR inference failed: {err}'}
 
 
 def get_paddle_ocr():
@@ -957,7 +991,7 @@ def get_paddle_ocr():
         try:
             from paddleocr import PaddleOCR
             # PaddleOCR does not expose a 'devanagari' language key; Hindi model covers Devanagari script.
-            _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang='hi', use_gpu=False, show_log=False)
+            _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang='hi', use_gpu=False)
             return _PADDLE_OCR
         except Exception as e:
             print('PaddleOCR load error:', e)
@@ -1005,8 +1039,16 @@ def extract_paddle_details(pil_image):
     img_arr = np.array(pil_image.convert("RGB"))
 
     try:
-        result = ocr.ocr(img_arr, cls=True)
+        result = ocr.ocr(img_arr)
     except Exception as err:
+        fallback = proprietary_document_pipeline(
+            pil_image,
+            char_predictor=None,
+            warmup_model=None,
+        )
+        if fallback.get('status') == 'ok':
+            fallback['engine'] = 'paddle_fallback_document_pipeline'
+            return fallback
         return {'status': 'error', 'message': f'PaddleOCR inference failed: {err}'}
     
     texts, confs = _parse_paddle_output(result)
