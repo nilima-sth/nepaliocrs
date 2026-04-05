@@ -21,5 +21,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# Download the heavy models inside the Docker image during build
+RUN python src/download_models.py
+
 EXPOSE 5000
 CMD ["python", "src/app.py"]
