@@ -1,7 +1,10 @@
 import gc
+import json
 import os
 import sys
 import base64
+import secrets
+from threading import BoundedSemaphore, Lock
 from io import BytesIO
 from pathlib import Path
 
@@ -10,8 +13,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
+from document_ocr import proprietary_document_pipeline
 
 cv2 = None
 cv2_import_error = None
@@ -21,33 +25,65 @@ except Exception as err:
     cv2 = None
     cv2_import_error = str(err)
 
+
+def _env_flag(name, default="0"):
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 torch.set_num_threads(max(1, min(2, os.cpu_count() or 2)))
+if cv2 is not None:
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CHECKPOINT_PATH = ROOT / "MallaNet" / "models" / "best_model.pth"
+KAGGLE_MODEL_PATH = ROOT / "kaggle-model" / "model" / "model.h5"
+MAX_UPLOAD_MB = max(1, int(os.getenv("OCR_MAX_UPLOAD_MB", "10")))
+MAX_IMAGE_SIDE = max(640, int(os.getenv("OCR_MAX_IMAGE_SIDE", "2200")))
+MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("OCR_MAX_CONCURRENT_REQUESTS", "1")))
+UNLOAD_MODELS_EACH_REQUEST = _env_flag("OCR_UNLOAD_MODELS_EACH_REQUEST", "0")
+ENABLE_PADDLE_FALLBACK = _env_flag("OCR_ENABLE_PADDLE_FALLBACK", "0")
+ENABLE_TRAIFIC_ENGINE = _env_flag("OCR_ENABLE_TRAIFIC_ENGINE", "0")
+INFERENCE_SEMAPHORE = BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
 TRAIFIC_APP_DIR = ROOT / "TraificNPR" / "application"
-if str(TRAIFIC_APP_DIR) not in sys.path:
+if ENABLE_TRAIFIC_ENGINE and str(TRAIFIC_APP_DIR) not in sys.path:
     sys.path.append(str(TRAIFIC_APP_DIR))
 
-try:
-    from model_loader import load_models as load_traific_models
-    from image_processing import process_frame as process_traific_frame
-    TRAIFIC_AVAILABLE = True
-    TRAIFIC_ERROR = None
-except ImportError as e:
+if ENABLE_TRAIFIC_ENGINE:
+    try:
+        from model_loader import load_models as load_traific_models
+        from image_processing import process_frame as process_traific_frame
+        TRAIFIC_AVAILABLE = True
+        TRAIFIC_ERROR = None
+    except ImportError as e:
+        TRAIFIC_AVAILABLE = False
+        TRAIFIC_ERROR = str(e)
+else:
     TRAIFIC_AVAILABLE = False
-    TRAIFIC_ERROR = str(e)
+    TRAIFIC_ERROR = "Traific engine disabled via OCR_ENABLE_TRAIFIC_ENGINE=0"
 
 _TRAIFIC_MODELS = None
+_TRAIFIC_MODEL_LOCK = Lock()
+
+
 def get_traific_models():
     global _TRAIFIC_MODELS
-    if _TRAIFIC_MODELS is None:
-        if not TRAIFIC_AVAILABLE:
-            raise RuntimeError(f"TraificNPR failed to import: {TRAIFIC_ERROR}")
-        _TRAIFIC_MODELS = load_traific_models()
+    if _TRAIFIC_MODELS is not None:
+        return _TRAIFIC_MODELS
+
+    with _TRAIFIC_MODEL_LOCK:
+        if _TRAIFIC_MODELS is None:
+            if not TRAIFIC_AVAILABLE:
+                raise RuntimeError(f"TraificNPR failed to import: {TRAIFIC_ERROR}")
+            _TRAIFIC_MODELS = load_traific_models()
     return _TRAIFIC_MODELS
 
 def unload_traific_models():
@@ -57,6 +93,106 @@ def unload_traific_models():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+_KAGGLE_MODEL = None
+_KAGGLE_MODEL_ERROR = None
+_KAGGLE_MODEL_LOCK = Lock()
+
+
+def _load_kaggle_model_legacy_h5(model_path, tf):
+    import h5py  # Lazy import so base startup remains light.
+
+    with h5py.File(str(model_path), "r") as h5_file:
+        raw_cfg = h5_file.attrs.get("model_config")
+
+    if raw_cfg is None:
+        raise RuntimeError("Legacy load failed: model_config missing in .h5 file.")
+
+    if isinstance(raw_cfg, bytes):
+        cfg_text = raw_cfg.decode("utf-8")
+    elif hasattr(raw_cfg, "decode"):
+        cfg_text = raw_cfg.decode("utf-8")
+    else:
+        cfg_text = str(raw_cfg)
+
+    parsed = json.loads(cfg_text)
+    config_root = parsed.get("config", {})
+    if isinstance(config_root, dict):
+        layer_specs = config_root.get("layers", [])
+        model_name = config_root.get("name", "sequential")
+    else:
+        layer_specs = config_root
+        model_name = "sequential"
+
+    model = tf.keras.Sequential(name=model_name)
+    has_input = False
+
+    for spec in layer_specs:
+        class_name = spec.get("class_name")
+        layer_cfg = dict(spec.get("config", {}))
+        trainable = bool(layer_cfg.pop("trainable", True))
+        batch_shape = layer_cfg.pop("batch_input_shape", None)
+
+        if batch_shape and not has_input:
+            model.add(tf.keras.layers.Input(shape=tuple(batch_shape[1:])))
+            has_input = True
+
+        if class_name == "Conv2D":
+            layer = tf.keras.layers.Conv2D(**layer_cfg)
+        elif class_name == "MaxPooling2D":
+            layer = tf.keras.layers.MaxPooling2D(**layer_cfg)
+        else:
+            raise RuntimeError(f"Legacy load failed: unsupported layer {class_name!r}.")
+
+        layer.trainable = trainable
+        model.add(layer)
+
+    model.load_weights(str(model_path))
+    return model
+
+
+def get_kaggle_model():
+    global _KAGGLE_MODEL, _KAGGLE_MODEL_ERROR
+    if _KAGGLE_MODEL is not None:
+        return _KAGGLE_MODEL
+    if _KAGGLE_MODEL_ERROR is not None:
+        return None
+
+    with _KAGGLE_MODEL_LOCK:
+        if _KAGGLE_MODEL is not None:
+            return _KAGGLE_MODEL
+        if _KAGGLE_MODEL_ERROR is not None:
+            return None
+
+        if not KAGGLE_MODEL_PATH.exists():
+            _KAGGLE_MODEL_ERROR = f"Kaggle model not found: {KAGGLE_MODEL_PATH}"
+            return None
+
+        try:
+            # Lazy import so base startup remains fast unless this engine is selected.
+            import tensorflow as tf  # type: ignore
+
+            _KAGGLE_MODEL = tf.keras.models.load_model(str(KAGGLE_MODEL_PATH))
+            return _KAGGLE_MODEL
+        except Exception as err:
+            # Fallback for some legacy Sequential .h5 formats that Keras 3 cannot deserialize directly.
+            try:
+                import tensorflow as tf  # type: ignore
+
+                _KAGGLE_MODEL = _load_kaggle_model_legacy_h5(KAGGLE_MODEL_PATH, tf)
+                _KAGGLE_MODEL_ERROR = None
+                return _KAGGLE_MODEL
+            except Exception as legacy_err:
+                _KAGGLE_MODEL_ERROR = f"{err} | Legacy fallback failed: {legacy_err}"
+                return None
+
+
+def unload_kaggle_model():
+    global _KAGGLE_MODEL
+    if _KAGGLE_MODEL is not None:
+        _KAGGLE_MODEL = None
+        gc.collect()
 
 
 # ---------------------------------------------------------
@@ -569,10 +705,139 @@ def extract_traific_details(pil_image):
         "debug_img": debug_pil_img
     }
 
+
+def _kaggle_prepare_input(pil_image, input_shape):
+    shape = input_shape[0] if isinstance(input_shape, list) else input_shape
+    if not isinstance(shape, tuple) or len(shape) != 4:
+        raise ValueError(f"Unsupported model input shape: {shape}")
+
+    _, d1, d2, d3 = shape
+    if d1 in (1, 3) and d3 not in (1, 3):
+        # Channels-first: (N, C, H, W)
+        channels = int(d1)
+        height = int(d2)
+        width = int(d3)
+        channels_first = True
+    else:
+        # Channels-last: (N, H, W, C)
+        height = int(d1)
+        width = int(d2)
+        channels = int(d3)
+        channels_first = False
+
+    mode = "L" if channels == 1 else "RGB"
+    resized = pil_image.convert(mode).resize((width, height), Image.BILINEAR)
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+
+    if channels == 1 and arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+
+    if channels_first:
+        arr = np.transpose(arr, (2, 0, 1))
+
+    return np.expand_dims(arr, axis=0), resized.convert("RGB")
+
+
+def extract_kaggle_details(pil_image):
+    model = get_kaggle_model()
+    if model is None:
+        return {"status": "error", "message": _KAGGLE_MODEL_ERROR or "Unable to load kaggle model."}
+
+    try:
+        x, preview_img = _kaggle_prepare_input(pil_image, model.input_shape)
+        pred = np.asarray(model.predict(x, verbose=0))
+
+        if pred.ndim == 2 and pred.shape[1] > 1:
+            class_idx = int(np.argmax(pred[0]))
+            conf = float(np.max(pred[0]))
+            label = f"class_{class_idx}"
+            digits_ascii = str(class_idx)
+        else:
+            score = float(pred.reshape(-1)[0])
+            is_handwritten = score >= 0.5
+            label = "handwritten" if is_handwritten else "not_handwritten"
+            conf = score if is_handwritten else 1.0 - score
+            digits_ascii = "1" if is_handwritten else "0"
+
+        return {
+            "status": "ok",
+            "plate_text": label,
+            "digits_ascii": digits_ascii,
+            "avg_conf": conf,
+            "debug_img": preview_img,
+        }
+    except Exception as err:
+        return {"status": "error", "message": f"Kaggle inference failed: {err}"}
+
 # ==============================================================================
 # FLASK APPLICATION EXPOSURE
 # ==============================================================================
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.errorhandler(413)
+def payload_too_large(_err):
+    return jsonify({"error": f"Uploaded file is too large. Max allowed size is {MAX_UPLOAD_MB} MB."}), 413
+
+
+def _normalize_input_image(file_stream):
+    pil_image = ImageOps.exif_transpose(Image.open(file_stream)).convert("RGB")
+    width, height = pil_image.size
+    max_side = max(width, height)
+
+    if max_side <= MAX_IMAGE_SIDE:
+        return pil_image
+
+    scale = MAX_IMAGE_SIDE / float(max_side)
+    target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    return pil_image.resize(target_size, resampling)
+
+
+def _maybe_release_resources(engine_choice):
+    if not UNLOAD_MODELS_EACH_REQUEST:
+        return
+
+    if engine_choice == "kaggle":
+        unload_kaggle_model()
+    elif engine_choice in {"indic", "malla"}:
+        unload_model()
+    elif engine_choice == "traific":
+        unload_traific_models()
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _api_token_is_valid(req):
+    expected = os.getenv("OCR_API_TOKEN", "").strip()
+    if not expected:
+        return False
+
+    supplied = (req.headers.get("X-API-Token") or "").strip()
+    if not supplied:
+        auth_header = (req.headers.get("Authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            supplied = auth_header[7:].strip()
+
+    if not supplied:
+        return False
+
+    return secrets.compare_digest(supplied, expected)
+
+
+def _run_ocr(engine_choice, pil_image):
+    engine = (engine_choice or "paddle").strip().lower()
+
+    if engine == 'paddle':
+        return extract_paddle_details(pil_image)
+    if engine in {'indic', 'malla'}:
+        return proprietary_document_pipeline(pil_image)
+    if engine == 'kaggle':
+        return extract_kaggle_details(pil_image)
+    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'indic', or 'kaggle'."}
 
 @app.route('/')
 def index():
@@ -582,27 +847,24 @@ def index():
 def api_extract():
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
-        
+
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "Empty filename"}), 400
 
-    engine_choice = request.form.get('engine', 'malla')
-    
+    engine_choice = request.form.get('engine', 'paddle')
+    acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        return jsonify({"error": "OCR engine is busy. Please retry in a few seconds."}), 429
+
     try:
-        pil_image = Image.open(file.stream).convert('RGB')
-        
-        if engine_choice == 'traific':
-            result = extract_traific_details(pil_image)
-        else:
-            result = extract_plate_details(pil_image)
+        pil_image = _normalize_input_image(file.stream)
+
+        result = _run_ocr(engine_choice, pil_image)
 
         if result['status'] != 'ok':
-            # Return 200 OK so the browser console doesn't show scary red errors,
-            # but keep the JSON error format so the frontend can display it cleanly.
             return jsonify({"error": result['message']}), 200
-            
-        # Convert the debug image to base64 for the frontend
+
         debug_pil = result.get('debug_img')
         debug_b64 = None
         if debug_pil:
@@ -610,30 +872,186 @@ def api_extract():
             debug_pil.save(buffered, format="JPEG", quality=85)
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
             debug_b64 = f"data:image/jpeg;base64,{img_str}"
-        
+
         response_data = {
             "status": "ok",
-            "plate_text": result['plate_text'],
-            "digits_ascii": result['digits_ascii'],
-            "avg_conf": round(result['avg_conf'], 4),
+            "engine": engine_choice,
+            "extracted_text": result.get('extracted_text', result.get('plate_text', '')),
+            "avg_conf": round(result.get('avg_conf', 0.0), 4),
             "debug_img": debug_b64
         }
         return jsonify(response_data)
-        
+
     except Exception as e:
         return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
     finally:
-        # Free memory aggressively after each request
-        if engine_choice == 'traific':
-            unload_traific_models()
-        else:
-            unload_model()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if acquired:
+            INFERENCE_SEMAPHORE.release()
+        _maybe_release_resources(engine_choice)
+
+
+@app.route('/api/v1/extract', methods=['POST'])
+def api_extract_v1():
+    if not _api_token_is_valid(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+
+    engine_choice = request.form.get('engine', 'paddle')
+    if engine_choice not in {'paddle', 'indic', 'kaggle', 'malla'}:
+        return jsonify({"error": "Invalid engine. Use 'paddle', 'indic', or 'kaggle'."}), 400
+
+    include_debug = request.form.get('include_debug', 'false').lower() in {'1', 'true', 'yes'}
+    acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        return jsonify({"error": "OCR engine is busy. Please retry in a few seconds."}), 429
+
+    try:
+        pil_image = _normalize_input_image(file.stream)
+        result = _run_ocr(engine_choice, pil_image)
+
+        if result['status'] != 'ok':
+            return jsonify({"error": result['message']}), 422
+
+        response_data = {
+            "status": "ok",
+            "engine": engine_choice,
+            "extracted_text": result.get('extracted_text', result.get('plate_text', '')),
+            "avg_conf": round(result.get('avg_conf', 0.0), 4),
+        }
+
+        if include_debug:
+            debug_pil = result.get('debug_img')
+            if debug_pil is not None:
+                buffered = BytesIO()
+                debug_pil.save(buffered, format='JPEG', quality=85)
+                img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                response_data['debug_img'] = f"data:image/jpeg;base64,{img_str}"
+
+        return jsonify(response_data), 200
+    except Exception as e:
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+    finally:
+        if acquired:
+            INFERENCE_SEMAPHORE.release()
+        _maybe_release_resources(engine_choice)
+
+
+_PADDLE_OCR = None
+_PADDLE_OCR_LOCK = Lock()
+
+
+def get_paddle_ocr():
+    global _PADDLE_OCR
+    if _PADDLE_OCR is not None:
+        return _PADDLE_OCR
+
+    with _PADDLE_OCR_LOCK:
+        if _PADDLE_OCR is not None:
+            return _PADDLE_OCR
+        try:
+            from paddleocr import PaddleOCR
+            # PaddleOCR does not expose a 'devanagari' language key; Hindi model covers Devanagari script.
+            _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang='hi', use_gpu=False, show_log=False)
+            return _PADDLE_OCR
+        except Exception as e:
+            print('PaddleOCR load error:', e)
+            return None
+
+def _parse_paddle_output(result):
+    texts = []
+    confs = []
+
+    if result is None:
+        return texts, confs
+
+    # Common output: list[page] where page is list[[box, [text, conf]]]
+    if isinstance(result, list):
+        for page in result:
+            if isinstance(page, list):
+                for item in page:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        rec = item[1]
+                        if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                            text = str(rec[0]).strip()
+                            if text:
+                                texts.append(text)
+                                try:
+                                    confs.append(float(rec[1]))
+                                except Exception:
+                                    confs.append(0.0)
+            elif isinstance(page, dict):
+                text = str(page.get("rec_text", "")).strip()
+                if text:
+                    texts.append(text)
+                    try:
+                        confs.append(float(page.get("rec_score", 0.0)))
+                    except Exception:
+                        confs.append(0.0)
+
+    return texts, confs
+
+
+def extract_paddle_details(pil_image):
+    ocr = get_paddle_ocr()
+    if not ocr:
+        return {'status': 'error', 'message': 'PaddleOCR not loaded properly'}
+
+    img_arr = np.array(pil_image.convert("RGB"))
+
+    try:
+        result = ocr.ocr(img_arr, cls=True)
+    except Exception as err:
+        return {'status': 'error', 'message': f'PaddleOCR inference failed: {err}'}
+    
+    texts, confs = _parse_paddle_output(result)
+
+    # Fall back to Tesseract+layout salvage path only when explicitly enabled.
+    if not texts:
+        if not ENABLE_PADDLE_FALLBACK:
+            return {
+                'status': 'ok',
+                'extracted_text': '',
+                'avg_conf': 0.0,
+                'debug_img': pil_image,
+            }
+
+        fallback = proprietary_document_pipeline(
+            pil_image,
+            char_predictor=_predict_char,
+            warmup_model=get_devanagari_model,
+        )
+        if fallback.get('status') == 'ok':
+            fallback['engine'] = 'paddle_fallback_document_pipeline'
+        return fallback
+
+    extracted = "\n".join(texts)
+    avg_conf = sum(confs) / len(confs) if confs else 0.0
+    return {
+        'status': 'ok',
+        'extracted_text': extracted,
+        'avg_conf': avg_conf,
+        'debug_img': pil_image,
+    }
+
 
 if __name__ == '__main__':
     # Make sure templates folder exists relative to app.py
     template_dir = Path(__file__).parent / 'templates'
     template_dir.mkdir(exist_ok=True)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app_port = int(os.getenv('PORT', '5000'))
+    app_debug = _env_flag('FLASK_DEBUG', '0')
+    disable_reloader = _env_flag('OCR_DISABLE_RELOADER', '1')
+    app.run(
+        host='0.0.0.0',
+        port=app_port,
+        debug=app_debug,
+        use_reloader=(app_debug and not disable_reloader),
+        threaded=True,
+    )
+
