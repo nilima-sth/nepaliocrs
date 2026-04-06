@@ -1,124 +1,132 @@
-# Nepali OCRs 
-This repository is about doing a feasibility study of various different OCRs for Nepali language for document digitization, license plate information extraction, and other use cases. The OCRs are evaluated based on their accuracy, speed, and ease of use.
+# Nepali OCRs
+
+Nepali OCRs is a Flask-based OCR service with method-wise evaluation scripts for Nepali document text extraction.
 
 ## Requirements
 
 - Python 3.10
 - pip
 
-Install dependencies:
+## Setup
+
+Install dependencies manually:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run locally
+Or use bootstrap in run scripts:
+
+- Windows: set BOOTSTRAP=1 and run run.bat
+- Linux/macOS: BOOTSTRAP=1 ./run.sh
+
+## Main run commands
+
+Two entry scripts are used at repository root:
+
+- run.bat (Windows)
+- run.sh (Linux/macOS)
+
+Supported modes:
+
+- serve: start Flask OCR API/UI
+- eval: run word and detection benchmarks
+- kaggle: start app with TensorFlow check for kaggle model mode
+
+Examples:
 
 ```bash
-python src/gradio_app.py
+# Linux/macOS
+./run.sh serve
+./run.sh eval
+./run.sh kaggle
 ```
 
-Open your browser:
-
-- `http://localhost:7860`
-
-## Run Flask OCR service (for Odoo/API integration)
-
-Use the existing startup script:
-
-```bash
-./run.sh
+```bat
+REM Windows
+run.bat serve
+run.bat eval
+run.bat kaggle
 ```
 
-The service runs on:
+Default mode is serve when no mode is passed.
 
-- `http://127.0.0.1:5000`
+## API endpoint
 
-### Token-protected API endpoint
+Base URL:
 
-Set an API token before running the service:
+- http://127.0.0.1:5000
 
-```bash
-export OCR_API_TOKEN="replace-with-a-long-random-token"
-./run.sh
-```
+Protected machine endpoint:
 
-Call machine endpoint:
+- POST /api/v1/extract
 
-- `POST /api/v1/extract`
-- Headers:
-	- `X-API-Token: <token>`
-	- or `Authorization: Bearer <token>`
-- Form fields:
-	- `file`: image file (required)
-	- `engine`: `malla`, `traific`, or `kaggle` (optional, default `malla`)
-	- `include_debug`: `true|false` (optional)
+Headers:
+
+- X-API-Token: <token>
+- or Authorization: Bearer <token>
+
+Form fields:
+
+- file: image file (required)
+- engine: indic, paddle, trocr, or kaggle (optional, default paddle)
+- include_debug: true|false (optional)
 
 Example:
 
 ```bash
 curl -X POST "http://127.0.0.1:5000/api/v1/extract" \
-	-H "X-API-Token: replace-with-a-long-random-token" \
-	-F "engine=malla" \
-	-F "include_debug=false" \
-	-F "file=@/absolute/path/to/plate.jpg"
+  -H "X-API-Token: replace-with-a-long-random-token" \
+  -F "engine=indic" \
+  -F "include_debug=false" \
+  -F "file=@/absolute/path/to/image.jpg"
 ```
 
-## Run with Kaggle Handwritten Model (.h5)
+## Method-wise evaluation
 
-The pretrained kaggle model is expected at:
+Mode eval runs both:
 
-- `kaggle-model/model/model.h5`
+- Word recognition benchmark: src/evaluate_wordset.py
+- Detection benchmark: src/evaluate_detection_testset.py
 
-Use the dedicated startup script:
+Environment variables:
 
-```bash
-./run_kaggle.sh
-```
+- WORD_LIMIT (default 120)
+- DET_LIMIT (default 30)
 
-What this script does:
+Outputs:
 
-- activates `.venv`
-- installs `tensorflow-cpu` and `h5py` only if TensorFlow is missing
-- starts Flask app (`src/app.py`)
+- results/eval_wordset/<run_id>/summary.md
+- results/eval_wordset/<run_id>/summary.json
+- results/eval_detection/<run_id>/summary.json
 
-Then in the UI choose engine:
+## Model bootstrap
 
-- `Kaggle Handwritten Model (.h5)`
+Model helper script:
 
-### Odoo integration concept
+- src/download_models.py
 
-Keep this OCR app as a separate microservice and call it from Odoo server-side Python using `requests`.
+It currently ensures availability of:
 
-```python
-import requests
+- PaddleOCR-VL source files
+- Indic-HTR repository
+- TrOCR snapshot
+- DBNet repository
 
-OCR_URL = "http://127.0.0.1:5000/api/v1/extract"
-OCR_TOKEN = "replace-with-a-long-random-token"
+Important:
 
-def extract_plate_from_image(image_path):
-		with open(image_path, "rb") as f:
-				response = requests.post(
-						OCR_URL,
-						headers={"X-API-Token": OCR_TOKEN},
-						files={"file": ("plate.jpg", f, "image/jpeg")},
-						data={"engine": "malla", "include_debug": "false"},
-						timeout=60,
-				)
-		response.raise_for_status()
-		return response.json()
-```
+- DBNet and Indic-HTR still require trained checkpoint files (.pth/.ckpt) for real inference.
 
 ## Docker
 
-Build the image:
+Build:
 
 ```bash
 docker build -t nepali-ocr-app .
 ```
 
-Run the container:
+Run:
 
 ```bash
-docker run -p 7860:7860 nepali-ocr-app
+docker run -p 5000:5000 nepali-ocr-app
 ```
