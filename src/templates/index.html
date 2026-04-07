@@ -23,6 +23,7 @@
                     <label class="block text-sm font-medium text-slate-700 mb-1">OCR Pipeline Engine</label>
                     <select name="engine" id="engine" class="w-full border-slate-300 rounded-md shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500">
                         <option value="indic" selected>Indic Pipeline (Handwritten Focus) - Recommended</option>
+                        <option value="malla">Malla Pipeline (Character Fallback Enabled)</option>
                         <option value="trocr">TrOCR Devanagari (Handwriting Recognition)</option>
                         <option value="paddle">PaddleOCR (General Document OCR)</option>
                         <option value="kaggle">Kaggle Handwriting Classifier (Routing Only)</option>
@@ -91,6 +92,68 @@
                 <div class="pt-4 border-t">
                     <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3 block">Debug View</span>
                     <img id="resDebugImg" class="rounded-lg shadow-md border mx-auto max-h-48" />
+                </div>
+            </div>
+        </div>
+
+        <!-- Benchmark Panel -->
+        <div class="bg-white rounded-xl shadow-sm p-6 border border-slate-200 md:col-span-2">
+            <h2 class="text-lg font-semibold border-b pb-2 mb-4">Benchmark Dashboard</h2>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="space-y-4 lg:col-span-1">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1">Engines (comma separated)</label>
+                        <input id="bmEngines" type="text" value="paddle,trocr,indic,malla" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1">Detectors (comma separated)</label>
+                        <input id="bmDetectors" type="text" value="tesseract,paddle,dbnet" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">K Folds</label>
+                            <input id="bmFolds" type="number" min="2" max="10" value="5" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Seed</label>
+                            <input id="bmSeed" type="number" min="1" value="42" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-3 gap-3">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Word Limit</label>
+                            <input id="bmWordLimit" type="number" min="10" value="120" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Doc Limit</label>
+                            <input id="bmDocLimit" type="number" min="10" value="60" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1">Det Limit</label>
+                            <input id="bmDetLimit" type="number" min="10" value="60" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        </div>
+                    </div>
+                    <button id="runBenchmarkBtn" type="button" class="w-full py-2 px-4 rounded-md text-white bg-emerald-600 hover:bg-emerald-700 text-sm font-medium">
+                        Run Test Benchmark
+                    </button>
+                    <p class="text-xs text-slate-500">Runs word k-fold, document extraction health, and detection k-fold reports in one flow.</p>
+                </div>
+
+                <div class="lg:col-span-2 space-y-4">
+                    <div id="bmLoader" class="hidden p-4 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 text-sm">
+                        Benchmark is running. This may take a few minutes depending on model cache and limits.
+                    </div>
+                    <div id="bmError" class="hidden p-4 rounded-md border border-red-200 bg-red-50 text-red-700 text-sm"></div>
+                    <div id="bmEmpty" class="p-6 rounded-md border border-slate-200 bg-slate-50 text-slate-500 text-sm">
+                        No benchmark run yet. Configure parameters and click Run Test Benchmark.
+                    </div>
+                    <div id="bmResults" class="hidden space-y-4">
+                        <div id="bmMeta" class="text-sm text-slate-700"></div>
+                        <div id="bmWordSummary" class="overflow-x-auto"></div>
+                        <div id="bmDocSummary" class="overflow-x-auto"></div>
+                        <div id="bmDetSummary" class="overflow-x-auto"></div>
+                        <div id="bmFoldDetails" class="space-y-3"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -188,6 +251,244 @@
             
             document.getElementById('resultBox').classList.remove('hidden');
         }
+
+        function toPct(v) {
+            return `${Math.round((parseFloat(v || 0) * 100) * 10) / 10}%`;
+        }
+
+        function benchmarkProcessing(isProcessing) {
+            const btn = document.getElementById('runBenchmarkBtn');
+            btn.disabled = isProcessing;
+            btn.innerText = isProcessing ? 'Running Benchmark...' : 'Run Test Benchmark';
+
+            document.getElementById('bmError').classList.add('hidden');
+            if (isProcessing) {
+                document.getElementById('bmLoader').classList.remove('hidden');
+                document.getElementById('bmResults').classList.add('hidden');
+                document.getElementById('bmEmpty').classList.add('hidden');
+            } else {
+                document.getElementById('bmLoader').classList.add('hidden');
+            }
+        }
+
+        function showBenchmarkError(msg) {
+            const box = document.getElementById('bmError');
+            box.innerText = msg;
+            box.classList.remove('hidden');
+            document.getElementById('bmLoader').classList.add('hidden');
+        }
+
+        function renderMetricBar(value, colorClass = 'bg-blue-500') {
+            const pct = Math.max(0, Math.min(100, Math.round(parseFloat(value || 0) * 100)));
+            return `
+                <div class="w-36 bg-slate-200 rounded-full h-2 overflow-hidden inline-block align-middle mr-2">
+                    <div class="${colorClass} h-2" style="width:${pct}%"></div>
+                </div>
+                <span class="text-xs text-slate-700">${pct}%</span>
+            `;
+        }
+
+        function renderWordSummary(wordKfold) {
+            const rows = Object.entries(wordKfold.engines || {}).map(([name, m]) => `
+                <tr class="border-b">
+                    <td class="py-2 pr-4 font-medium">${name}</td>
+                    <td class="py-2 pr-4">${renderMetricBar(m.mean_exact_match, 'bg-emerald-500')}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.mean_avg_cer || 0)).toFixed(4)}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.mean_avg_conf || 0)).toFixed(4)}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <h3 class="font-semibold text-slate-800 mb-2">Word K-Fold Summary</h3>
+                <p class="text-xs text-slate-500 mb-2">Samples: ${wordKfold.sample_count} | Folds: ${wordKfold.k_folds}</p>
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-slate-500 border-b">
+                            <th class="py-2 pr-4">Engine</th>
+                            <th class="py-2 pr-4">Mean Exact Match</th>
+                            <th class="py-2 pr-4">Mean CER</th>
+                            <th class="py-2 pr-4">Mean Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            `;
+        }
+
+        function renderDocumentSummary(documentLevel) {
+            const rows = Object.entries(documentLevel.engines || {}).map(([name, m]) => `
+                <tr class="border-b">
+                    <td class="py-2 pr-4 font-medium">${name}</td>
+                    <td class="py-2 pr-4">${toPct(m.non_empty_rate)}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.avg_words || 0)).toFixed(1)}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.avg_sentences || 0)).toFixed(1)}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.avg_paragraphs || 0)).toFixed(1)}</td>
+                    <td class="py-2 pr-4">${(parseFloat(m.avg_conf || 0)).toFixed(4)}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <h3 class="font-semibold text-slate-800 mb-2">Document-Level Extraction Health</h3>
+                <p class="text-xs text-slate-500 mb-2">Images: ${documentLevel.image_count}</p>
+                <p class="text-xs text-amber-700 mb-2">${documentLevel.note || ''}</p>
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-slate-500 border-b">
+                            <th class="py-2 pr-4">Engine</th>
+                            <th class="py-2 pr-4">Non-empty Rate</th>
+                            <th class="py-2 pr-4">Avg Words</th>
+                            <th class="py-2 pr-4">Avg Sentences</th>
+                            <th class="py-2 pr-4">Avg Paragraphs</th>
+                            <th class="py-2 pr-4">Avg Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            `;
+        }
+
+        function renderDetectionSummary(detectionKfold) {
+            const rows = Object.entries(detectionKfold.detectors || {}).map(([name, m]) => `
+                <tr class="border-b">
+                    <td class="py-2 pr-4 font-medium">${name}</td>
+                    <td class="py-2 pr-4">${toPct(m.mean_precision)}</td>
+                    <td class="py-2 pr-4">${toPct(m.mean_recall)}</td>
+                    <td class="py-2 pr-4">${renderMetricBar(m.mean_hmean, 'bg-indigo-500')}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <h3 class="font-semibold text-slate-800 mb-2">Detection K-Fold Summary</h3>
+                <p class="text-xs text-slate-500 mb-2">Pairs: ${detectionKfold.pair_count} | Folds: ${detectionKfold.k_folds}</p>
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-slate-500 border-b">
+                            <th class="py-2 pr-4">Detector</th>
+                            <th class="py-2 pr-4">Mean Precision</th>
+                            <th class="py-2 pr-4">Mean Recall</th>
+                            <th class="py-2 pr-4">Mean HMean</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            `;
+        }
+
+        function renderFoldDetails(report) {
+            const wordDetails = Object.entries(report.word_kfold.engines || {}).map(([name, m]) => {
+                const rows = (m.folds || []).map(f => `
+                    <tr class="border-b">
+                        <td class="py-1 pr-3">${f.fold}</td>
+                        <td class="py-1 pr-3">${f.test_size}</td>
+                        <td class="py-1 pr-3">${toPct(f.exact_match)}</td>
+                        <td class="py-1 pr-3">${(parseFloat(f.avg_cer || 0)).toFixed(4)}</td>
+                        <td class="py-1 pr-3">${f.errors}</td>
+                    </tr>
+                `).join('');
+
+                return `
+                    <details class="border rounded-md p-3">
+                        <summary class="cursor-pointer font-medium">Word folds: ${name}</summary>
+                        <table class="w-full text-xs mt-2">
+                            <thead>
+                                <tr class="text-left text-slate-500 border-b">
+                                    <th class="py-1 pr-3">Fold</th>
+                                    <th class="py-1 pr-3">Test Size</th>
+                                    <th class="py-1 pr-3">Exact</th>
+                                    <th class="py-1 pr-3">CER</th>
+                                    <th class="py-1 pr-3">Errors</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </details>
+                `;
+            }).join('');
+
+            const detDetails = Object.entries(report.detection_kfold.detectors || {}).map(([name, m]) => {
+                const rows = (m.folds || []).map(f => `
+                    <tr class="border-b">
+                        <td class="py-1 pr-3">${f.fold}</td>
+                        <td class="py-1 pr-3">${f.test_size}</td>
+                        <td class="py-1 pr-3">${toPct(f.precision)}</td>
+                        <td class="py-1 pr-3">${toPct(f.recall)}</td>
+                        <td class="py-1 pr-3">${toPct(f.hmean)}</td>
+                        <td class="py-1 pr-3">${f.errors}</td>
+                    </tr>
+                `).join('');
+
+                return `
+                    <details class="border rounded-md p-3">
+                        <summary class="cursor-pointer font-medium">Detection folds: ${name}</summary>
+                        <table class="w-full text-xs mt-2">
+                            <thead>
+                                <tr class="text-left text-slate-500 border-b">
+                                    <th class="py-1 pr-3">Fold</th>
+                                    <th class="py-1 pr-3">Test Size</th>
+                                    <th class="py-1 pr-3">Precision</th>
+                                    <th class="py-1 pr-3">Recall</th>
+                                    <th class="py-1 pr-3">HMean</th>
+                                    <th class="py-1 pr-3">Errors</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </details>
+                `;
+            }).join('');
+
+            return `${wordDetails}${detDetails}`;
+        }
+
+        function renderBenchmark(report) {
+            document.getElementById('bmMeta').innerHTML =
+                `<div class="p-3 rounded-md border bg-slate-50">
+                    <div><strong>Run ID:</strong> ${report.run_id}</div>
+                    <div><strong>Timestamp:</strong> ${report.timestamp}</div>
+                    <div><strong>Config:</strong> engines=${(report.config.engines || []).join(',')} | detectors=${(report.config.detectors || []).join(',')} | k=${report.config.k_folds}</div>
+                </div>`;
+
+            document.getElementById('bmWordSummary').innerHTML = renderWordSummary(report.word_kfold);
+            document.getElementById('bmDocSummary').innerHTML = renderDocumentSummary(report.document_level);
+            document.getElementById('bmDetSummary').innerHTML = renderDetectionSummary(report.detection_kfold);
+            document.getElementById('bmFoldDetails').innerHTML = renderFoldDetails(report);
+
+            document.getElementById('bmEmpty').classList.add('hidden');
+            document.getElementById('bmResults').classList.remove('hidden');
+        }
+
+        async function runBenchmark() {
+            const payload = {
+                engines: document.getElementById('bmEngines').value,
+                detectors: document.getElementById('bmDetectors').value,
+                k_folds: parseInt(document.getElementById('bmFolds').value || '5', 10),
+                seed: parseInt(document.getElementById('bmSeed').value || '42', 10),
+                word_limit: parseInt(document.getElementById('bmWordLimit').value || '120', 10),
+                doc_limit: parseInt(document.getElementById('bmDocLimit').value || '60', 10),
+                detection_limit: parseInt(document.getElementById('bmDetLimit').value || '60', 10),
+            };
+
+            benchmarkProcessing(true);
+            try {
+                const res = await fetch('/api/benchmark', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok || data.error) {
+                    showBenchmarkError(data.error || 'Benchmark failed unexpectedly.');
+                } else {
+                    renderBenchmark(data.report);
+                }
+            } catch (err) {
+                showBenchmarkError(err.message || String(err));
+            } finally {
+                benchmarkProcessing(false);
+            }
+        }
+
+        document.getElementById('runBenchmarkBtn').addEventListener('click', runBenchmark);
     </script>
 </body>
 </html>
