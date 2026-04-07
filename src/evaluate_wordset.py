@@ -217,7 +217,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate OCR engines on labeled Nepali word crops.")
     parser.add_argument("--labels-csv", default="datas/archivelabelled/labels.csv")
     parser.add_argument("--images-dir", default="datas/archivelabelled/crops")
-    parser.add_argument("--engines", default="paddle,trocr,indic")
+    parser.add_argument("--engines", default="paddle,trocr,indic,malla")
     parser.add_argument("--trocr-model", default="paudelanil/trocr-devanagari-2")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output-dir", default="results/eval_wordset")
@@ -240,7 +240,7 @@ def main() -> None:
 
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     if not engines:
-        raise RuntimeError("No engines selected. Use --engines paddle,trocr,indic")
+        raise RuntimeError("No engines selected. Use --engines paddle,trocr,indic,malla")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) / run_id
