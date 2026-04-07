@@ -63,7 +63,7 @@ case "$MODE" in
         DET_LIMIT="${DET_LIMIT:-30}"
 
         echo "[INFO] Running word recognition benchmark..."
-        .venv/bin/python3 src/evaluate_wordset.py --engines paddle,trocr,indic --limit "${WORD_LIMIT}"
+        .venv/bin/python3 src/evaluate_wordset.py --engines paddle,trocr,indic,malla --limit "${WORD_LIMIT}"
 
         echo "[INFO] Running detection benchmark..."
         .venv/bin/python3 src/evaluate_detection_testset.py --detectors tesseract,paddle,dbnet --limit "${DET_LIMIT}"

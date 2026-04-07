@@ -79,7 +79,7 @@ set "DET_LIMIT=%DET_LIMIT%"
 if "%DET_LIMIT%"=="" set "DET_LIMIT=30"
 
 echo [INFO] Running word recognition benchmark...
-".\.venv\Scripts\python.exe" src\evaluate_wordset.py --engines paddle,trocr,indic --limit %WORD_LIMIT%
+".\.venv\Scripts\python.exe" src\evaluate_wordset.py --engines paddle,trocr,indic,malla --limit %WORD_LIMIT%
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Word benchmark failed.
     pause

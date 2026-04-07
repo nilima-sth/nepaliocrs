@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from huggingface_hub import snapshot_download
 
@@ -51,6 +52,20 @@ def download_models():
             print(f"[WARNING] Failed to clone DBNet repository: {e}")
     else:
         print("[INFO] DBNet repository already exists. Skipping.")
+
+    print("\n[INFO] Ensuring MallaNet checkpoint is available under models/mallanet...")
+    mallanet_src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MallaNet", "models", "best_model.pth")
+    mallanet_dst_dir = os.path.join(base_dir, "mallanet")
+    mallanet_dst = os.path.join(mallanet_dst_dir, "best_model.pth")
+    if os.path.exists(mallanet_src):
+        os.makedirs(mallanet_dst_dir, exist_ok=True)
+        if not os.path.exists(mallanet_dst):
+            shutil.copy2(mallanet_src, mallanet_dst)
+            print("[INFO] MallaNet checkpoint copied to models/mallanet/best_model.pth")
+        else:
+            print("[INFO] MallaNet checkpoint already mirrored. Skipping.")
+    else:
+        print(f"[WARNING] MallaNet checkpoint not found at {mallanet_src}")
 
     print("\n[NOTE] DBNet and Indic-HTR still require trained checkpoints (.pth/.ckpt) for real inference.")
 

@@ -164,6 +164,45 @@ class DocumentPipelineEngine:
             return EngineResult(status="error", error=f"Indic/document pipeline failed: {err}")
 
 
+class MallaPipelineEngine:
+    _bindings: Optional[Tuple[object, object]] = None
+    _lock = Lock()
+
+    @classmethod
+    def _load_bindings(cls) -> Tuple[object, object]:
+        if cls._bindings is not None:
+            return cls._bindings
+
+        with cls._lock:
+            if cls._bindings is not None:
+                return cls._bindings
+
+            # Imported lazily to avoid import cycles when app.py imports ocr_engines.
+            from app import _predict_char, get_devanagari_model
+
+            cls._bindings = (_predict_char, get_devanagari_model)
+            return cls._bindings
+
+    def predict(self, pil_image: Image.Image) -> EngineResult:
+        try:
+            char_predictor, warmup_model = self._load_bindings()
+            out = proprietary_document_pipeline(
+                pil_image,
+                char_predictor=char_predictor,
+                warmup_model=warmup_model,
+            )
+            if out.get("status") != "ok":
+                return EngineResult(status="error", error=out.get("message", "Unknown Malla pipeline error"))
+            return EngineResult(
+                status="ok",
+                text=str(out.get("extracted_text", "")),
+                conf=float(out.get("avg_conf", 0.0)),
+                debug_img=out.get("debug_img"),
+            )
+        except Exception as err:
+            return EngineResult(status="error", error=f"Malla pipeline failed: {err}")
+
+
 class TrOCREngine:
     _bundles: Dict[str, object] = {}
     _lock = Lock()
@@ -443,10 +482,12 @@ def build_text_engine(name: str, trocr_model_id: str = "paudelanil/trocr-devanag
         return PaddleTextEngine()
     if key in {"indic", "indic_pipeline", "document", "doc"}:
         return DocumentPipelineEngine(allow_char_fallback=False)
+    if key in {"malla", "mallanet", "malla_pipeline"}:
+        return MallaPipelineEngine()
     if key in {"trocr", "trocr_devanagari"}:
         return TrOCREngine(model_id=trocr_model_id)
     raise ValueError(f"Unsupported text engine: {name}")
 
 
 def available_text_engines() -> List[str]:
-    return ["paddle", "indic", "trocr"]
+    return ["paddle", "indic", "malla", "trocr"]
