@@ -69,7 +69,7 @@ Headers:
 Form fields:
 
 - file: image file (required)
-- engine: indic, paddle, trocr, or kaggle (optional, default paddle)
+- engine: indic, malla, paddle, trocr, or kaggle (optional, default paddle)
 - include_debug: true|false (optional)
 
 Example:
@@ -88,6 +88,13 @@ Mode eval runs both:
 
 - Word recognition benchmark: src/evaluate_wordset.py
 - Detection benchmark: src/evaluate_detection_testset.py
+
+Default word benchmark engines in eval mode:
+
+- paddle
+- trocr
+- indic
+- malla
 
 Environment variables:
 
