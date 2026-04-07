@@ -17,6 +17,7 @@ from PIL import Image, ImageOps
 from torchvision import transforms
 from document_ocr import proprietary_document_pipeline
 from ocr_engines import TrOCREngine
+from dashboard_benchmark import run_dashboard_benchmark
 
 cv2 = None
 cv2_import_error = None
@@ -74,6 +75,7 @@ else:
 
 _TRAIFIC_MODELS = None
 _TRAIFIC_MODEL_LOCK = Lock()
+_BENCHMARK_LOCK = Lock()
 
 
 def get_traific_models():
@@ -944,6 +946,77 @@ def api_extract_v1():
         if acquired:
             INFERENCE_SEMAPHORE.release()
         _maybe_release_resources(engine_choice)
+
+
+def _parse_int(value, default_value, min_value, max_value):
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default_value)
+    return max(min_value, min(max_value, parsed))
+
+
+def _parse_float(value, default_value, min_value, max_value):
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default_value)
+    return max(min_value, min(max_value, parsed))
+
+
+def _parse_csv_list(value, default_csv):
+    raw = value if isinstance(value, str) and value.strip() else default_csv
+    return [item.strip().lower() for item in raw.split(',') if item.strip()]
+
+
+@app.route('/api/benchmark', methods=['POST'])
+def api_benchmark():
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    engines = _parse_csv_list(payload.get('engines', ''), 'paddle,trocr,indic,malla')
+    detectors = _parse_csv_list(payload.get('detectors', ''), 'tesseract,paddle,dbnet')
+
+    allowed_engines = {'paddle', 'trocr', 'indic', 'malla'}
+    allowed_detectors = {'tesseract', 'paddle', 'dbnet'}
+
+    engines = [e for e in engines if e in allowed_engines]
+    detectors = [d for d in detectors if d in allowed_detectors]
+
+    if not engines:
+        engines = ['paddle', 'trocr', 'indic', 'malla']
+    if not detectors:
+        detectors = ['tesseract', 'paddle', 'dbnet']
+
+    k_folds = _parse_int(payload.get('k_folds', 5), 5, 2, 10)
+    word_limit = _parse_int(payload.get('word_limit', 120), 120, 10, 5000)
+    doc_limit = _parse_int(payload.get('doc_limit', 60), 60, 10, 2000)
+    detection_limit = _parse_int(payload.get('detection_limit', 60), 60, 10, 2000)
+    seed = _parse_int(payload.get('seed', 42), 42, 1, 10_000_000)
+    iou_threshold = _parse_float(payload.get('iou_threshold', 0.5), 0.5, 0.1, 0.95)
+    dbnet_checkpoint = (payload.get('dbnet_checkpoint') or '').strip() or None
+
+    if not _BENCHMARK_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'A benchmark run is already in progress. Please wait for it to finish.'}), 429
+
+    try:
+        report = run_dashboard_benchmark(
+            engines=engines,
+            detectors=detectors,
+            k_folds=k_folds,
+            word_limit=word_limit,
+            doc_limit=doc_limit,
+            detection_limit=detection_limit,
+            seed=seed,
+            iou_threshold=iou_threshold,
+            trocr_model_id=TROCR_MODEL_ID,
+            dbnet_checkpoint=dbnet_checkpoint,
+            root_dir=ROOT,
+        )
+        return jsonify({'status': 'ok', 'report': report})
+    except Exception as err:
+        return jsonify({'error': f'Benchmark failed: {err}'}), 500
+    finally:
+        _BENCHMARK_LOCK.release()
 
 
 _PADDLE_OCR = None
