@@ -107,6 +107,28 @@ Outputs:
 - results/eval_wordset/<run_id>/summary.json
 - results/eval_detection/<run_id>/summary.json
 
+## Dashboard benchmark runner
+
+The Flask dashboard now includes a Run Test Benchmark section.
+
+It can execute in one run:
+
+- Word-level k-fold evaluation (exact match, CER, confidence)
+- Document-level extraction health metrics (word/sentence/paragraph counts, non-empty rate)
+- Detection k-fold evaluation (precision, recall, hmean)
+
+API route used by dashboard:
+
+- POST /api/benchmark
+
+Benchmark reports are stored at:
+
+- results/dashboard_benchmark/<run_id>/report.json
+
+Note:
+
+- Document-level section is health-oriented because train/test page folders do not include paragraph-level ground-truth transcripts.
+
 ## Model bootstrap
 
 Model helper script:
