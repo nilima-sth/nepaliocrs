@@ -18,6 +18,7 @@ python-bidi
 paddlepaddle
 paddleocr
 pytesseract
+pypdfium2
 
 tensorflow
 transformers

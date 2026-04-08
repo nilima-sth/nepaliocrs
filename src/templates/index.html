@@ -31,7 +31,7 @@
                 </div>
                 
                 <div>
-                    <label class="block text-sm font-medium text-slate-700 mb-1">Document Image</label>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Document Image or PDF</label>
                     <div class="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-slate-300 border-dashed rounded-md hover:bg-slate-50 transition cursor-pointer" onclick="document.getElementById('fileInput').click()">
                         <div class="space-y-1 text-center">
                             <svg class="mx-auto h-12 w-12 text-slate-400" stroke="currentColor" fill="none" viewBox="0 0 48 48" aria-hidden="true">
@@ -39,16 +39,23 @@
                             </svg>
                             <div class="flex text-sm text-slate-600 justify-center">
                                 <label class="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none">
-                                    <span>Upload an Image</span>
-                                    <input id="fileInput" name="file" type="file" class="sr-only" accept="image/*" onchange="previewImage(event)">
+                                    <span>Upload Image/PDF</span>
+                                    <input id="fileInput" name="file" type="file" class="sr-only" accept="image/*,application/pdf" onchange="previewImage(event)">
                                 </label>
                             </div>
-                            <p class="text-xs text-slate-500">PNG, JPG, WEBP</p>
+                            <p class="text-xs text-slate-500">PNG, JPG, WEBP, PDF (first page)</p>
                         </div>
                     </div>
                     <div class="mt-4 hidden" id="previewContainer">
                         <img id="imgPreview" class="max-h-48 mx-auto rounded-lg shadow-sm border" />
+                        <p id="filePreviewText" class="hidden text-center text-sm text-slate-600"></p>
                     </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-slate-700 mb-1">Optional Ground Truth Text</label>
+                    <textarea id="referenceText" rows="4" class="w-full border-slate-300 rounded-md shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500" placeholder="Paste expected words/text here to compare predicted tokens against actual tokens."></textarea>
+                    <p class="text-xs text-slate-500 mt-1">If provided, each detected segment is matched against this token sequence for quick quality checks.</p>
                 </div>
 
                 <button type="submit" id="submitBtn" class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition">
@@ -92,6 +99,29 @@
                 <div class="pt-4 border-t">
                     <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3 block">Debug View</span>
                     <img id="resDebugImg" class="rounded-lg shadow-md border mx-auto max-h-48" />
+                </div>
+                <div class="pt-4 border-t">
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3 block">Segmentation Summary</span>
+                    <div id="resSegSummary" class="text-sm text-slate-700 bg-slate-50 rounded-md border border-slate-200 p-3">No segment data available.</div>
+                </div>
+                <div>
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3 block">Detected Segments</span>
+                    <div class="overflow-auto border border-slate-200 rounded-md max-h-80">
+                        <table class="w-full text-xs">
+                            <thead class="bg-slate-100 sticky top-0">
+                                <tr class="text-left text-slate-600">
+                                    <th class="py-2 px-2">#</th>
+                                    <th class="py-2 px-2">BBox</th>
+                                    <th class="py-2 px-2">Predicted</th>
+                                    <th class="py-2 px-2">Confidence</th>
+                                    <th class="py-2 px-2">Actual</th>
+                                    <th class="py-2 px-2">Match</th>
+                                    <th class="py-2 px-2">Source</th>
+                                </tr>
+                            </thead>
+                            <tbody id="resSegTable" class="divide-y divide-slate-100"></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </div>
@@ -162,21 +192,39 @@
     <script>
         function previewImage(event) {
             const file = event.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    document.getElementById('imgPreview').src = e.target.result;
-                    document.getElementById('previewContainer').classList.remove('hidden');
-                }
-                reader.readAsDataURL(file);
+            const preview = document.getElementById('imgPreview');
+            const previewText = document.getElementById('filePreviewText');
+            const container = document.getElementById('previewContainer');
+
+            if (!file) {
+                container.classList.add('hidden');
+                return;
             }
+
+            container.classList.remove('hidden');
+            const isPdf = file.type === 'application/pdf' || (file.name || '').toLowerCase().endsWith('.pdf');
+
+            if (isPdf) {
+                preview.classList.add('hidden');
+                previewText.classList.remove('hidden');
+                previewText.innerText = `PDF selected: ${file.name}. OCR will run on the first page.`;
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                preview.src = e.target.result;
+                preview.classList.remove('hidden');
+                previewText.classList.add('hidden');
+            }
+            reader.readAsDataURL(file);
         }
 
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const fileInput = document.getElementById('fileInput');
             if(!fileInput.files[0]) {
-                alert('Please select an image first.');
+                alert('Please select an image or PDF first.');
                 return;
             }
 
@@ -185,6 +233,8 @@
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
             formData.append('engine', document.querySelector('[name="engine"]').value);
+            formData.append('reference_text', document.getElementById('referenceText').value || '');
+            formData.append('include_segments', 'true');
 
             try {
                 const res = await fetch('/api/extract', {
@@ -216,6 +266,8 @@
                 document.getElementById('errorBox').classList.add('hidden');
                 document.getElementById('resultBox').classList.add('hidden');
                 document.getElementById('resConfBar').style.width = '0%';
+                document.getElementById('resSegSummary').innerText = 'Running segmentation...';
+                document.getElementById('resSegTable').innerHTML = '';
             } else {
                 document.getElementById('loader').classList.add('hidden');
             }
@@ -225,6 +277,68 @@
             const box = document.getElementById('errorBox');
             box.innerText = msg;
             box.classList.remove('hidden');
+        }
+
+        function escapeHtml(value) {
+            const text = String(value ?? '');
+            return text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function renderSegmentSummary(data) {
+            const summary = data.comparison_summary || {};
+            const segCount = Number(data.segment_count || 0);
+            const hasComparison = typeof summary.word_accuracy === 'number';
+
+            if (!segCount) {
+                return 'No segments were returned for this engine/output.';
+            }
+
+            if (!hasComparison) {
+                return `Detected ${segCount} segments. Add optional ground-truth text to compare predicted words against expected words.`;
+            }
+
+            const acc = Math.round((summary.word_accuracy || 0) * 1000) / 10;
+            return `Detected ${segCount} segments. Compared ${summary.compared_count} tokens, matched ${summary.matched_count} (${acc}% token accuracy), ${summary.extra_predictions} extra predictions, ${summary.missed_reference_tokens} missing reference tokens.`;
+        }
+
+        function renderSegmentRows(segments) {
+            if (!Array.isArray(segments) || !segments.length) {
+                return '<tr><td colspan="7" class="py-3 px-2 text-slate-500">No segment details available.</td></tr>';
+            }
+
+            return segments.map((seg, idx) => {
+                const bbox = Array.isArray(seg.bbox) && seg.bbox.length >= 4
+                    ? `[${seg.bbox.slice(0, 4).join(', ')}]`
+                    : '-';
+                const conf = Number.isFinite(Number(seg.confidence))
+                    ? `${Math.round(Number(seg.confidence) * 1000) / 10}%`
+                    : '-';
+                const actual = seg.actual_text ? escapeHtml(seg.actual_text) : '-';
+
+                let matchBadge = '<span class="text-slate-500">N/A</span>';
+                if (seg.is_match === true) {
+                    matchBadge = '<span class="text-emerald-700 font-semibold">Match</span>';
+                } else if (seg.is_match === false) {
+                    matchBadge = '<span class="text-rose-700 font-semibold">Mismatch</span>';
+                }
+
+                return `
+                    <tr>
+                        <td class="py-2 px-2 text-slate-500">${idx + 1}</td>
+                        <td class="py-2 px-2 font-mono text-[11px] text-slate-600">${escapeHtml(bbox)}</td>
+                        <td class="py-2 px-2">${escapeHtml(seg.predicted_text || '')}</td>
+                        <td class="py-2 px-2 text-slate-600">${conf}</td>
+                        <td class="py-2 px-2">${actual}</td>
+                        <td class="py-2 px-2">${matchBadge}</td>
+                        <td class="py-2 px-2 text-slate-600">${escapeHtml(seg.source || '-')}</td>
+                    </tr>
+                `;
+            }).join('');
         }
 
         function showResult(data) {
@@ -248,6 +362,9 @@
             } else {
                 document.getElementById('resDebugImg').classList.add('hidden');
             }
+
+            document.getElementById('resSegSummary').innerText = renderSegmentSummary(data);
+            document.getElementById('resSegTable').innerHTML = renderSegmentRows(data.segments || []);
             
             document.getElementById('resultBox').classList.remove('hidden');
         }

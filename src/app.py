@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import base64
+import re
 import secrets
 from threading import BoundedSemaphore, Lock
 from io import BytesIO
@@ -13,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 from torchvision import transforms
 from document_ocr import proprietary_document_pipeline
 from ocr_engines import TrOCREngine
@@ -763,12 +764,26 @@ def extract_kaggle_details(pil_image):
             conf = score if is_handwritten else 1.0 - score
             digits_ascii = "1" if is_handwritten else "0"
 
+        w, h = pil_image.size
+        segments = [
+            {
+                "word_index": 0,
+                "bbox": [0, 0, int(w), int(h)],
+                "predicted_text": label,
+                "raw_text": label,
+                "confidence": round(float(conf), 4),
+                "source": "kaggle_classifier",
+                "used_fallback": False,
+            }
+        ]
+
         return {
             "status": "ok",
             "plate_text": label,
             "digits_ascii": digits_ascii,
             "avg_conf": conf,
             "debug_img": preview_img,
+            "segments": segments,
         }
     except Exception as err:
         return {"status": "error", "message": f"Kaggle inference failed: {err}"}
@@ -785,8 +800,60 @@ def payload_too_large(_err):
     return jsonify({"error": f"Uploaded file is too large. Max allowed size is {MAX_UPLOAD_MB} MB."}), 413
 
 
+def _pil_to_base64_jpeg(pil_image, quality=85):
+    if pil_image is None:
+        return None
+    buffered = BytesIO()
+    pil_image.save(buffered, format="JPEG", quality=quality)
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{img_str}"
+
+
+def _load_pdf_first_page(raw_file_bytes):
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except Exception as err:
+        raise RuntimeError("PDF upload requires pypdfium2. Install with 'pip install pypdfium2'.") from err
+
+    document = None
+    page = None
+    try:
+        document = pdfium.PdfDocument(raw_file_bytes)
+        if len(document) < 1:
+            raise RuntimeError("Uploaded PDF has no pages.")
+        page = document[0]
+        bitmap = page.render(scale=2.5)
+        pil_image = bitmap.to_pil().convert("RGB")
+        return pil_image
+    except Exception as err:
+        raise RuntimeError(f"Unable to render first page from PDF: {err}") from err
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if document is not None:
+            try:
+                document.close()
+            except Exception:
+                pass
+
+
 def _normalize_input_image(file_stream):
-    pil_image = ImageOps.exif_transpose(Image.open(file_stream)).convert("RGB")
+    raw_file = file_stream.read()
+    if not raw_file:
+        raise ValueError("Uploaded file is empty.")
+
+    try:
+        if raw_file.startswith(b"%PDF"):
+            pil_image = _load_pdf_first_page(raw_file)
+        else:
+            pil_image = Image.open(BytesIO(raw_file))
+        pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
+    except Exception as err:
+        raise ValueError(f"Unable to read uploaded file as image/PDF: {err}") from err
+
     width, height = pil_image.size
     max_side = max(width, height)
 
@@ -797,6 +864,187 @@ def _normalize_input_image(file_stream):
     target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
     resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     return pil_image.resize(target_size, resampling)
+
+
+def _clean_token_for_compare(token):
+    compact = re.sub(r"\s+", "", str(token or ""), flags=re.UNICODE)
+    compact = re.sub(r"[^\w]+", "", compact, flags=re.UNICODE)
+    return compact.lower().strip()
+
+
+def _align_segments_with_reference(segments, reference_text):
+    if not isinstance(segments, list):
+        return [], None
+
+    reference_tokens = []
+    if isinstance(reference_text, str) and reference_text.strip():
+        reference_tokens = [tok for tok in re.split(r"\s+", reference_text.strip()) if tok]
+
+    aligned = []
+    matched = 0
+    compared = 0
+
+    for idx, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            continue
+
+        record = dict(segment)
+        predicted = str(record.get("predicted_text") or record.get("text") or "").strip()
+        record["predicted_text"] = predicted
+
+        bbox = record.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                record["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+            except Exception:
+                record["bbox"] = None
+        else:
+            record["bbox"] = None
+
+        actual = reference_tokens[idx] if idx < len(reference_tokens) else ""
+        record["actual_text"] = actual
+
+        if actual:
+            compared += 1
+            is_match = _clean_token_for_compare(predicted) == _clean_token_for_compare(actual)
+            record["is_match"] = bool(is_match)
+            if is_match:
+                matched += 1
+        else:
+            record["is_match"] = None
+
+        aligned.append(record)
+
+    summary = {
+        "predicted_token_count": len(aligned),
+        "reference_token_count": len(reference_tokens),
+        "compared_count": compared,
+        "matched_count": matched,
+        "word_accuracy": (matched / compared) if compared else None,
+        "extra_predictions": max(0, len(aligned) - len(reference_tokens)),
+        "missed_reference_tokens": max(0, len(reference_tokens) - len(aligned)),
+    }
+    return aligned, summary
+
+
+def _render_segment_overlay(pil_image, segments):
+    if pil_image is None:
+        return None
+
+    canvas = pil_image.convert("RGB").copy()
+    if not isinstance(segments, list) or not segments:
+        return canvas
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        bbox = segment.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+        except Exception:
+            continue
+
+        is_match = segment.get("is_match")
+        if is_match is True:
+            color = (34, 197, 94)
+        elif is_match is False:
+            color = (239, 68, 68)
+        else:
+            color = (37, 99, 235)
+
+        draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=2)
+
+        predicted_text = str(segment.get("predicted_text") or "").strip()
+        actual_text = str(segment.get("actual_text") or "").strip()
+        confidence = segment.get("confidence")
+
+        label_parts = []
+        if predicted_text:
+            label_parts.append(predicted_text)
+        if isinstance(confidence, (int, float)):
+            label_parts.append(f"{int(round(float(confidence) * 100.0))}%")
+        if actual_text:
+            label_parts.append(f"GT:{actual_text}")
+
+        if not label_parts:
+            continue
+
+        label = " | ".join(label_parts)
+        if len(label) > 60:
+            label = f"{label[:57]}..."
+
+        tx = max(0, x1)
+        ty = max(0, y1 - 14)
+        try:
+            text_bounds = draw.textbbox((tx, ty), label, font=font)
+            tw = max(1, int(text_bounds[2] - text_bounds[0]))
+            th = max(1, int(text_bounds[3] - text_bounds[1]))
+        except Exception:
+            tw, th = (max(16, 6 * len(label)), 10)
+        draw.rectangle([(tx, ty), (tx + tw + 4, ty + th + 2)], fill=color)
+        draw.text((tx + 2, ty + 1), label, fill=(255, 255, 255), font=font)
+
+    return canvas
+
+
+def _poly_to_bbox(poly):
+    try:
+        arr = np.asarray(poly, dtype=np.float32)
+        if arr.size == 0:
+            return None
+        xs = arr[:, 0]
+        ys = arr[:, 1]
+        return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+    except Exception:
+        return None
+
+
+def _extract_paddle_segments(raw_result):
+    segments = []
+    if not isinstance(raw_result, list):
+        return segments
+
+    for page in raw_result:
+        if not isinstance(page, list):
+            continue
+        for item in page:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+
+            bbox = _poly_to_bbox(item[0])
+            if bbox is None:
+                continue
+
+            rec = item[1]
+            predicted_text = ""
+            confidence = 0.0
+            if isinstance(rec, (list, tuple)) and len(rec) >= 1:
+                predicted_text = str(rec[0]).strip()
+                if len(rec) > 1:
+                    try:
+                        confidence = float(rec[1])
+                    except Exception:
+                        confidence = 0.0
+
+            segments.append(
+                {
+                    "word_index": len(segments),
+                    "bbox": bbox,
+                    "predicted_text": predicted_text,
+                    "raw_text": predicted_text,
+                    "confidence": round(float(confidence), 4),
+                    "source": "paddleocr",
+                    "used_fallback": False,
+                }
+            )
+
+    return segments
 
 
 def _maybe_release_resources(engine_choice):
@@ -839,11 +1087,13 @@ def _run_ocr(engine_choice, pil_image):
         return extract_paddle_details(pil_image)
     if engine == 'trocr':
         return extract_trocr_details(pil_image)
-    if engine in {'indic', 'malla'}:
-        return proprietary_document_pipeline(pil_image)
+    if engine == 'indic':
+        return extract_indic_details(pil_image)
+    if engine == 'malla':
+        return extract_malla_details(pil_image)
     if engine == 'kaggle':
         return extract_kaggle_details(pil_image)
-    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'trocr', 'indic', or 'kaggle'."}
+    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'trocr', 'indic', 'malla', or 'kaggle'."}
 
 @app.route('/')
 def index():
@@ -859,6 +1109,8 @@ def api_extract():
         return jsonify({"error": "Empty filename"}), 400
 
     engine_choice = request.form.get('engine', 'paddle')
+    reference_text = request.form.get('reference_text', '')
+    include_segments = request.form.get('include_segments', 'true').lower() in {'1', 'true', 'yes'}
     acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
     if not acquired:
         return jsonify({"error": "OCR engine is busy. Please retry in a few seconds."}), 429
@@ -871,21 +1123,30 @@ def api_extract():
         if result['status'] != 'ok':
             return jsonify({"error": result['message']}), 200
 
+        aligned_segments = []
+        comparison_summary = None
+        if include_segments:
+            aligned_segments, comparison_summary = _align_segments_with_reference(result.get('segments', []), reference_text)
+
         debug_pil = result.get('debug_img')
-        debug_b64 = None
-        if debug_pil:
-            buffered = BytesIO()
-            debug_pil.save(buffered, format="JPEG", quality=85)
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            debug_b64 = f"data:image/jpeg;base64,{img_str}"
+        if include_segments and aligned_segments:
+            debug_pil = _render_segment_overlay(pil_image, aligned_segments)
+
+        debug_b64 = _pil_to_base64_jpeg(debug_pil, quality=85)
 
         response_data = {
             "status": "ok",
             "engine": engine_choice,
             "extracted_text": result.get('extracted_text', result.get('plate_text', '')),
             "avg_conf": round(result.get('avg_conf', 0.0), 4),
-            "debug_img": debug_b64
+            "debug_img": debug_b64,
+            "segment_count": len(aligned_segments),
         }
+
+        if include_segments:
+            response_data["segments"] = aligned_segments
+            response_data["comparison_summary"] = comparison_summary
+
         return jsonify(response_data)
 
     except Exception as e:
@@ -910,9 +1171,11 @@ def api_extract_v1():
 
     engine_choice = request.form.get('engine', 'paddle')
     if engine_choice not in {'paddle', 'trocr', 'indic', 'kaggle', 'malla'}:
-        return jsonify({"error": "Invalid engine. Use 'paddle', 'trocr', 'indic', or 'kaggle'."}), 400
+        return jsonify({"error": "Invalid engine. Use 'paddle', 'trocr', 'indic', 'malla', or 'kaggle'."}), 400
 
     include_debug = request.form.get('include_debug', 'false').lower() in {'1', 'true', 'yes'}
+    include_segments = request.form.get('include_segments', 'false').lower() in {'1', 'true', 'yes'}
+    reference_text = request.form.get('reference_text', '')
     acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
     if not acquired:
         return jsonify({"error": "OCR engine is busy. Please retry in a few seconds."}), 429
@@ -931,13 +1194,19 @@ def api_extract_v1():
             "avg_conf": round(result.get('avg_conf', 0.0), 4),
         }
 
+        aligned_segments = []
+        comparison_summary = None
+        if include_segments:
+            aligned_segments, comparison_summary = _align_segments_with_reference(result.get('segments', []), reference_text)
+            response_data['segments'] = aligned_segments
+            response_data['comparison_summary'] = comparison_summary
+
         if include_debug:
             debug_pil = result.get('debug_img')
+            if include_segments and aligned_segments:
+                debug_pil = _render_segment_overlay(pil_image, aligned_segments)
             if debug_pil is not None:
-                buffered = BytesIO()
-                debug_pil.save(buffered, format='JPEG', quality=85)
-                img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                response_data['debug_img'] = f"data:image/jpeg;base64,{img_str}"
+                response_data['debug_img'] = _pil_to_base64_jpeg(debug_pil, quality=85)
 
         return jsonify(response_data), 200
     except Exception as e:
@@ -1043,14 +1312,60 @@ def extract_trocr_details(pil_image):
         result = engine.predict(pil_image)
         if result.status != 'ok':
             return {'status': 'error', 'message': result.error or 'TrOCR inference failed'}
+        w, h = pil_image.size
+        trocr_text = str(result.text or '').strip()
+        segments = []
+        if trocr_text:
+            segments.append(
+                {
+                    'word_index': 0,
+                    'bbox': [0, 0, int(w), int(h)],
+                    'predicted_text': trocr_text,
+                    'raw_text': trocr_text,
+                    'confidence': float(result.conf),
+                    'source': 'trocr_full_image',
+                    'used_fallback': False,
+                }
+            )
         return {
             'status': 'ok',
-            'extracted_text': result.text,
+            'extracted_text': trocr_text,
             'avg_conf': float(result.conf),
             'debug_img': result.debug_img or pil_image,
+            'segments': segments,
         }
     except Exception as err:
         return {'status': 'error', 'message': f'TrOCR inference failed: {err}'}
+
+
+def extract_indic_details(pil_image):
+    try:
+        result = proprietary_document_pipeline(
+            pil_image,
+            char_predictor=None,
+            warmup_model=None,
+            include_segments=True,
+        )
+        if result.get('status') == 'ok':
+            result['engine'] = 'indic_document_pipeline'
+        return result
+    except Exception as err:
+        return {'status': 'error', 'message': f'Indic pipeline failed: {err}'}
+
+
+def extract_malla_details(pil_image):
+    try:
+        result = proprietary_document_pipeline(
+            pil_image,
+            char_predictor=_predict_char,
+            warmup_model=get_devanagari_model,
+            include_segments=True,
+        )
+        if result.get('status') == 'ok':
+            result['engine'] = 'malla_document_pipeline'
+        return result
+    except Exception as err:
+        return {'status': 'error', 'message': f'Malla pipeline failed: {err}'}
 
 
 def get_paddle_ocr():
@@ -1118,6 +1433,7 @@ def extract_paddle_details(pil_image):
             pil_image,
             char_predictor=None,
             warmup_model=None,
+            include_segments=True,
         )
         if fallback.get('status') == 'ok':
             fallback['engine'] = 'paddle_fallback_document_pipeline'
@@ -1125,6 +1441,7 @@ def extract_paddle_details(pil_image):
         return {'status': 'error', 'message': f'PaddleOCR inference failed: {err}'}
     
     texts, confs = _parse_paddle_output(result)
+    segments = _extract_paddle_segments(result)
 
     # Fall back to Tesseract+layout salvage path only when explicitly enabled.
     if not texts:
@@ -1134,12 +1451,14 @@ def extract_paddle_details(pil_image):
                 'extracted_text': '',
                 'avg_conf': 0.0,
                 'debug_img': pil_image,
+                'segments': segments,
             }
 
         fallback = proprietary_document_pipeline(
             pil_image,
             char_predictor=_predict_char,
             warmup_model=get_devanagari_model,
+            include_segments=True,
         )
         if fallback.get('status') == 'ok':
             fallback['engine'] = 'paddle_fallback_document_pipeline'
@@ -1152,6 +1471,7 @@ def extract_paddle_details(pil_image):
         'extracted_text': extracted,
         'avg_conf': avg_conf,
         'debug_img': pil_image,
+        'segments': segments,
     }
 
 

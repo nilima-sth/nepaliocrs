@@ -1,0 +1,52 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag (e.g. v1.0.0)"
+        required: true
+        default: "manual"
+      include_models:
+        description: "Download models during image build"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-ghcr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine model download mode
+        id: flags
+        run: |
+          if [ "${{ github.event.inputs.include_models }}" = "true" ]; then
+            echo "skip_model_download=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_model_download=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            SKIP_MODEL_DOWNLOAD=${{ steps.flags.outputs.skip_model_download }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nepaliocrs:${{ github.event.inputs.image_tag }}
+            ghcr.io/${{ github.repository_owner }}/nepaliocrs:latest

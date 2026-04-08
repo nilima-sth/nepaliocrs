@@ -68,9 +68,11 @@ Headers:
 
 Form fields:
 
-- file: image file (required)
+- file: image or PDF file (required). For PDF, first page is used.
 - engine: indic, malla, paddle, trocr, or kaggle (optional, default paddle)
 - include_debug: true|false (optional)
+- include_segments: true|false (optional, default false)
+- reference_text: optional expected text for token-level comparison against detected segments
 
 Example:
 
@@ -128,6 +130,49 @@ Benchmark reports are stored at:
 Note:
 
 - Document-level section is health-oriented because train/test page folders do not include paragraph-level ground-truth transcripts.
+
+## Segmentation inspection in dashboard
+
+In the main upload panel:
+
+- Upload image or PDF (first page is automatically rendered for OCR).
+- Select any engine (indic, malla, paddle, trocr, kaggle).
+- Optional: paste expected text in Ground Truth Text box.
+
+The result panel now includes:
+
+- Segmentation overlay view (word boxes with prediction labels).
+- Segment table with bbox, predicted token, confidence, source, and optional match/mismatch.
+- Token comparison summary when reference text is provided.
+
+## CI/CD (GitHub Actions)
+
+Two workflows are included:
+
+- CI: `.github/workflows/ci.yml`
+  - Trigger: push to `main`/`Gradio`, pull requests
+  - Uses lightweight dependencies from `requirements-ci.txt`
+  - Runs source compile check and unit tests
+
+- CD: `.github/workflows/cd.yml`
+  - Trigger: manual (`workflow_dispatch`)
+  - Builds and pushes Docker image to GHCR
+  - Supports `include_models=true|false` to control heavy model download during image build
+
+Notes:
+
+- CI is intentionally fast and does not download large model checkpoints.
+- CD can build lean images (`include_models=false`) or full images (`include_models=true`).
+
+## De-fluff checklist
+
+If the project feels noisy, keep only one clear path for each concern:
+
+- Inference path: keep one default engine chain and mark alternatives as optional.
+- Evaluation path: one benchmark command, one output folder schema.
+- Deployment path: one Dockerfile, one CD target (GHCR).
+- Dependencies: keep runtime deps in `requirements.txt`, CI deps in `requirements-ci.txt`.
+- Experiments: keep notebooks/experimental scripts out of runtime CI checks.
 
 ## Model bootstrap
 

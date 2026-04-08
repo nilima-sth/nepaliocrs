@@ -10,7 +10,12 @@ _DEFAULT_TESSERACT = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 if _DEFAULT_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(_DEFAULT_TESSERACT)
 
-def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=None):
+def proprietary_document_pipeline(
+    pil_image,
+    char_predictor=None,
+    warmup_model=None,
+    include_segments=False,
+):
     """
     PROPRIETARY "MALLA-ENSEMBLE" ARCHITECTURE
     1. OpenCV Adaptive Denoising tailored for old/yellowed documents
@@ -45,6 +50,7 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
     # Prepare return variables
     debug_image = open_cv_image.copy()
     document_lines = {}
+    segments = [] if include_segments else None
     
     # Step 2: Extract layout and base probabilities via Tesseract sequence OCR.
     # Try Nepali+Hindi+English first, then gracefully fall back.
@@ -68,6 +74,7 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
     # Step 3: Run the Verification Pipeline
     for i in range(n_boxes):
         word_text = data['text'][i].strip()
+        original_word_text = word_text
         try:
             conf = float(str(data['conf'][i]))
         except Exception:
@@ -76,6 +83,9 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
         # -1 confidence indicates a structural block (like a paragraph boundary) rather than a word
         if conf > -1 and len(word_text) > 0:
             x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            segment_conf = max(0.0, min(1.0, conf / 100.0))
+            source = "tesseract"
+            used_fallback = False
             
             # Expand bounding box slightly for safer cropping
             pad = 2
@@ -101,6 +111,7 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
                     char_boxes = sorted(char_boxes, key=lambda b: b[0])
                     
                     verified_characters = []
+                    verified_confidences = []
                     for bx, by, bw, bh in char_boxes:
                         # Filter out tiny noise dots
                         if bw * bh > 15:
@@ -112,16 +123,41 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
                             
                             if char_pred != "?":
                                 verified_characters.append(char_pred)
-                                avg_conf_list.append(char_conf * 100) # scale to 100 max
+                                verified_confidences.append(char_conf)
                     
                     # If MallaNet successfully salvaged chars, override the Sequence OCR output completely
                     if verified_characters:
                         word_text = "".join(verified_characters)
+                        source = "malla_fallback"
+                        used_fallback = True
+                        if verified_confidences:
+                            segment_conf = float(np.mean(verified_confidences))
+                            avg_conf_list.append(segment_conf * 100.0)
+                        else:
+                            avg_conf_list.append(conf)
+                    else:
+                        avg_conf_list.append(conf)
+                else:
+                    avg_conf_list.append(conf)
                 
             else:
                 # Draw a GREEN box indicating Sequence OCR handled it fine natively
                 cv2.rectangle(debug_image, (x1, y1), (x2, y2), (0, 255, 0), 1)
                 avg_conf_list.append(conf)
+
+            if include_segments and segments is not None:
+                segments.append(
+                    {
+                        "word_index": len(segments),
+                        "line_id": None,
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "predicted_text": word_text,
+                        "raw_text": original_word_text,
+                        "confidence": round(float(segment_conf), 4),
+                        "source": source,
+                        "used_fallback": used_fallback,
+                    }
+                )
 
             # Store the word dynamically into its correct line hierarchy
             block_num = data['block_num'][i]
@@ -133,6 +169,8 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
                 document_lines[line_id] = []
             
             document_lines[line_id].append(word_text)
+            if include_segments and segments is not None:
+                segments[-1]["line_id"] = line_id
 
     # Re-assemble the document text formatting
     final_text_blocks = []
@@ -147,9 +185,12 @@ def proprietary_document_pipeline(pil_image, char_predictor=None, warmup_model=N
     # Ensure debug image is returned as a proper object
     debug_image_rgb = cv2.cvtColor(debug_image, cv2.COLOR_BGR2RGB)
     
-    return {
+    response = {
         "status": "ok",
         "extracted_text": final_compiled_text,
         "avg_conf": float(total_avg_conf) / 100.0, # Normalizing back to 0-1 for UI parity
         "debug_img": Image.fromarray(debug_image_rgb)
     }
+    if include_segments and segments is not None:
+        response["segments"] = segments
+    return response
