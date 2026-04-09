@@ -22,12 +22,17 @@
                 <div>
                     <label class="block text-sm font-medium text-slate-700 mb-1">OCR Pipeline Engine</label>
                     <select name="engine" id="engine" class="w-full border-slate-300 rounded-md shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500">
-                        <option value="indic" selected>Indic Pipeline (Handwritten Focus) - Recommended</option>
-                        <option value="malla">Malla Pipeline (Character Fallback Enabled)</option>
-                        <option value="trocr">TrOCR Devanagari (Handwriting Recognition)</option>
-                        <option value="paddle">PaddleOCR (General Document OCR)</option>
-                        <option value="kaggle">Kaggle Handwriting Classifier (Routing Only)</option>
+                        {% for engine in core_engines %}
+                        <option value="{{ engine }}" {% if engine == default_engine %}selected{% endif %}>{{ engine_labels.get(engine, engine) }}</option>
+                        {% endfor %}
+                        {% for engine in non_core_engines %}
+                        <option value="{{ engine }}" data-tier="non-core" {% if not non_core_enabled %}hidden{% endif %}>{{ engine_labels.get(engine, engine) }}</option>
+                        {% endfor %}
                     </select>
+                    <label class="mt-2 flex items-center gap-2 text-xs text-slate-600">
+                        <input id="showNonCoreEngines" type="checkbox" class="rounded border-slate-300" {% if non_core_enabled %}checked{% endif %}>
+                        Show non-core research engines
+                    </label>
                 </div>
                 
                 <div>
@@ -133,11 +138,11 @@
                 <div class="space-y-4 lg:col-span-1">
                     <div>
                         <label class="block text-sm font-medium text-slate-700 mb-1">Engines (comma separated)</label>
-                        <input id="bmEngines" type="text" value="paddle,trocr,indic,malla" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        <input id="bmEngines" type="text" value="{{ default_benchmark_engines }}" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
                     </div>
                     <div>
                         <label class="block text-sm font-medium text-slate-700 mb-1">Detectors (comma separated)</label>
-                        <input id="bmDetectors" type="text" value="tesseract,paddle,dbnet" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
+                        <input id="bmDetectors" type="text" value="{{ default_benchmark_detectors }}" class="w-full border-slate-300 rounded-md shadow-sm p-2 border" />
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div>
@@ -166,7 +171,7 @@
                     <button id="runBenchmarkBtn" type="button" class="w-full py-2 px-4 rounded-md text-white bg-emerald-600 hover:bg-emerald-700 text-sm font-medium">
                         Run Test Benchmark
                     </button>
-                    <p class="text-xs text-slate-500">Runs word k-fold, document extraction health, and detection k-fold reports in one flow.</p>
+                    <p class="text-xs text-slate-500">Core profile runs stable engines only. Enable non-core research engines from the checkbox above when needed.</p>
                 </div>
 
                 <div class="lg:col-span-2 space-y-4">
@@ -190,6 +195,44 @@
     </main>
 
     <script>
+        const CORE_BM_ENGINES = '{{ core_benchmark_engines }}';
+        const ALL_BM_ENGINES = '{{ all_benchmark_engines }}';
+        const CORE_BM_DETECTORS = '{{ core_benchmark_detectors }}';
+        const ALL_BM_DETECTORS = '{{ all_benchmark_detectors }}';
+        const DEFAULT_ENGINE = '{{ default_engine }}';
+
+        function applyEngineProfile() {
+            const checkbox = document.getElementById('showNonCoreEngines');
+            const engineSelect = document.getElementById('engine');
+            if (!checkbox || !engineSelect) {
+                return;
+            }
+
+            const showNonCore = checkbox.checked;
+            const nonCoreOptions = Array.from(engineSelect.querySelectorAll('option[data-tier="non-core"]'));
+            nonCoreOptions.forEach(option => {
+                option.hidden = !showNonCore;
+            });
+
+            if (!showNonCore) {
+                const nonCoreValues = new Set(nonCoreOptions.map(option => String(option.value || '').toLowerCase()));
+                const selected = String(engineSelect.value || '').toLowerCase();
+                if (nonCoreValues.has(selected)) {
+                    engineSelect.value = DEFAULT_ENGINE;
+                }
+                document.getElementById('bmEngines').value = CORE_BM_ENGINES;
+                document.getElementById('bmDetectors').value = CORE_BM_DETECTORS;
+                return;
+            }
+
+            if (!document.getElementById('bmEngines').value.trim()) {
+                document.getElementById('bmEngines').value = ALL_BM_ENGINES;
+            }
+            if (!document.getElementById('bmDetectors').value.trim()) {
+                document.getElementById('bmDetectors').value = ALL_BM_DETECTORS;
+            }
+        }
+
         function previewImage(event) {
             const file = event.target.files[0];
             const preview = document.getElementById('imgPreview');
@@ -606,6 +649,8 @@
         }
 
         document.getElementById('runBenchmarkBtn').addEventListener('click', runBenchmark);
+        document.getElementById('showNonCoreEngines').addEventListener('change', applyEngineProfile);
+        applyEngineProfile();
     </script>
 </body>
 </html>

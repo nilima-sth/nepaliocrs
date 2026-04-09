@@ -41,6 +41,10 @@ anpr_uploads/
 models/
 kaggle-model/
 
+# Ignore all markdown files except README.md
+*.md
+!README.md
+
 # Optional placeholders (if used)
 !models/.gitkeep
 !results/.gitkeep

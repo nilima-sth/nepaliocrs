@@ -57,10 +57,11 @@ set "OCR_ENABLE_PADDLE_FALLBACK=0"
 
 if /I "%MODE%"=="serve" goto :run_serve
 if /I "%MODE%"=="eval" goto :run_eval
+if /I "%MODE%"=="select" goto :run_select
 if /I "%MODE%"=="kaggle" goto :run_kaggle
 
 echo [ERROR] Unknown mode: %MODE%
-echo [INFO] Valid modes: serve ^| eval ^| kaggle
+echo [INFO] Valid modes: serve ^| eval ^| select ^| kaggle
 pause
 exit /b 1
 
@@ -79,7 +80,7 @@ set "DET_LIMIT=%DET_LIMIT%"
 if "%DET_LIMIT%"=="" set "DET_LIMIT=30"
 
 echo [INFO] Running word recognition benchmark...
-".\.venv\Scripts\python.exe" src\evaluate_wordset.py --engines paddle,trocr,indic,malla --limit %WORD_LIMIT%
+".\.venv\Scripts\python.exe" src\evaluate_wordset.py --engines malla,indic,paddle --limit %WORD_LIMIT%
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Word benchmark failed.
     pause
@@ -87,7 +88,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [INFO] Running detection benchmark...
-".\.venv\Scripts\python.exe" src\evaluate_detection_testset.py --detectors tesseract,paddle,dbnet --limit %DET_LIMIT%
+".\.venv\Scripts\python.exe" src\evaluate_detection_testset.py --detectors tesseract --limit %DET_LIMIT%
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Detection benchmark failed.
     pause
@@ -95,6 +96,25 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [DONE] Evaluation runs completed. Check results\eval_wordset and results\eval_detection.
+goto :done
+
+:run_select
+echo [INFO] Mode: select
+set "SELECT_LIMIT=%SELECT_LIMIT%"
+if "%SELECT_LIMIT%"=="" set "SELECT_LIMIT=200"
+
+set "SELECT_FOLDS=%SELECT_FOLDS%"
+if "%SELECT_FOLDS%"=="" set "SELECT_FOLDS=5"
+
+echo [INFO] Running core model selection benchmark...
+".\.venv\Scripts\python.exe" src\select_core_model.py --engines malla,indic,paddle --limit %SELECT_LIMIT% --k-folds %SELECT_FOLDS%
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Core model selection failed.
+    pause
+    exit /b 1
+)
+
+echo [DONE] Model selection complete. Check results\model_selection.
 goto :done
 
 :run_kaggle

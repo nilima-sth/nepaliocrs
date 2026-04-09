@@ -31,6 +31,7 @@ Supported modes:
 
 - serve: start Flask OCR API/UI
 - eval: run word and detection benchmarks
+- select: rank core OCR models and recommend fine-tune target
 - kaggle: start app with TensorFlow check for kaggle model mode
 
 Examples:
@@ -39,6 +40,7 @@ Examples:
 # Linux/macOS
 ./run.sh serve
 ./run.sh eval
+./run.sh select
 ./run.sh kaggle
 ```
 
@@ -46,6 +48,7 @@ Examples:
 REM Windows
 run.bat serve
 run.bat eval
+run.bat select
 run.bat kaggle
 ```
 
@@ -93,10 +96,9 @@ Mode eval runs both:
 
 Default word benchmark engines in eval mode:
 
-- paddle
-- trocr
-- indic
 - malla
+- indic
+- paddle
 
 Environment variables:
 
@@ -136,14 +138,42 @@ Note:
 In the main upload panel:
 
 - Upload image or PDF (first page is automatically rendered for OCR).
-- Select any engine (indic, malla, paddle, trocr, kaggle).
+- Core profile is shown by default (malla, indic, paddle).
+- Optional toggle shows non-core research engines (trocr, kaggle).
 - Optional: paste expected text in Ground Truth Text box.
+
+Enable non-core profile from environment when needed:
+
+- `OCR_ENABLE_NON_CORE_PROFILE=1`
 
 The result panel now includes:
 
 - Segmentation overlay view (word boxes with prediction labels).
 - Segment table with bbox, predicted token, confidence, source, and optional match/mismatch.
 - Token comparison summary when reference text is provided.
+
+## Fast model selection
+
+Use `select` mode for quick ranking with k-fold comparison:
+
+```bash
+./run.sh select
+```
+
+```bat
+run.bat select
+```
+
+Outputs:
+
+- `results/model_selection/<run_id>/ranking.json`
+- `results/model_selection/<run_id>/ranking.md`
+
+This gives:
+
+- ranked core models by selection score
+- recommended model to fine-tune next
+- fine-tune hint for the winner
 
 ## CI/CD (GitHub Actions)
 
@@ -173,6 +203,29 @@ If the project feels noisy, keep only one clear path for each concern:
 - Deployment path: one Dockerfile, one CD target (GHCR).
 - Dependencies: keep runtime deps in `requirements.txt`, CI deps in `requirements-ci.txt`.
 - Experiments: keep notebooks/experimental scripts out of runtime CI checks.
+
+## Runtime vs research split
+
+- Runtime boundary notes: `runtime/BOUNDARY.md`
+- Research boundary notes: `research/BOUNDARY.md`
+
+Research directories moved under `research/`:
+
+- `research/MallaNet/`
+- `research/TraificNPR/`
+- `research/tools/`
+
+## Branch protection checklist
+
+Use and enforce:
+
+- `.github/BRANCH_PROTECTION_CHECKLIST.md`
+
+Key policy:
+
+- require CI `quality` check
+- no direct push to protected branches
+- PR + approval before merge
 
 ## Model bootstrap
 

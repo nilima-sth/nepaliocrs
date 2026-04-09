@@ -54,7 +54,7 @@ def download_models():
         print("[INFO] DBNet repository already exists. Skipping.")
 
     print("\n[INFO] Ensuring MallaNet checkpoint is available under models/mallanet...")
-    mallanet_src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MallaNet", "models", "best_model.pth")
+    mallanet_src = os.path.join(os.path.dirname(os.path.dirname(__file__)), "research", "MallaNet", "models", "best_model.pth")
     mallanet_dst_dir = os.path.join(base_dir, "mallanet")
     mallanet_dst = os.path.join(mallanet_dst_dir, "best_model.pth")
     if os.path.exists(mallanet_src):

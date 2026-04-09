@@ -63,12 +63,22 @@ case "$MODE" in
         DET_LIMIT="${DET_LIMIT:-30}"
 
         echo "[INFO] Running word recognition benchmark..."
-        .venv/bin/python3 src/evaluate_wordset.py --engines paddle,trocr,indic,malla --limit "${WORD_LIMIT}"
+        .venv/bin/python3 src/evaluate_wordset.py --engines malla,indic,paddle --limit "${WORD_LIMIT}"
 
         echo "[INFO] Running detection benchmark..."
-        .venv/bin/python3 src/evaluate_detection_testset.py --detectors tesseract,paddle,dbnet --limit "${DET_LIMIT}"
+        .venv/bin/python3 src/evaluate_detection_testset.py --detectors tesseract --limit "${DET_LIMIT}"
 
         echo "[DONE] Evaluation runs completed. Check results/eval_wordset and results/eval_detection."
+        ;;
+
+    select)
+        echo "[INFO] Mode: select"
+        SELECT_LIMIT="${SELECT_LIMIT:-200}"
+        SELECT_FOLDS="${SELECT_FOLDS:-5}"
+
+        echo "[INFO] Running core model selection benchmark..."
+        .venv/bin/python3 src/select_core_model.py --engines malla,indic,paddle --limit "${SELECT_LIMIT}" --k-folds "${SELECT_FOLDS}"
+        echo "[DONE] Model selection complete. Check results/model_selection."
         ;;
 
     kaggle)
@@ -89,7 +99,7 @@ PY
 
     *)
         echo "[ERROR] Unknown mode: ${MODE}"
-        echo "[INFO] Valid modes: serve | eval | kaggle"
+        echo "[INFO] Valid modes: serve | eval | select | kaggle"
         exit 1
         ;;
 esac

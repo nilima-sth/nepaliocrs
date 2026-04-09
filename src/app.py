@@ -32,6 +32,21 @@ except Exception as err:
 def _env_flag(name, default="0"):
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _csv_env_values(name, default_csv, allowed_values):
+    allowed = [str(item).strip().lower() for item in allowed_values if str(item).strip()]
+    allowed_set = set(allowed)
+
+    raw = str(os.getenv(name, default_csv) or "")
+    selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    filtered = [item for item in selected if item in allowed_set]
+    if filtered:
+        return filtered
+
+    fallback = [item.strip().lower() for item in str(default_csv).split(",") if item.strip()]
+    fallback = [item for item in fallback if item in allowed_set]
+    return fallback or allowed[:1]
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
@@ -45,8 +60,9 @@ if cv2 is not None:
         pass
 
 ROOT = Path(__file__).resolve().parents[1]
+RESEARCH_ROOT = ROOT / "research"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CHECKPOINT_PATH = ROOT / "MallaNet" / "models" / "best_model.pth"
+CHECKPOINT_PATH = RESEARCH_ROOT / "MallaNet" / "models" / "best_model.pth"
 KAGGLE_MODEL_PATH = ROOT / "kaggle-model" / "model" / "model.h5"
 MAX_UPLOAD_MB = max(1, int(os.getenv("OCR_MAX_UPLOAD_MB", "10")))
 MAX_IMAGE_SIDE = max(640, int(os.getenv("OCR_MAX_IMAGE_SIDE", "2200")))
@@ -57,7 +73,32 @@ ENABLE_TRAIFIC_ENGINE = _env_flag("OCR_ENABLE_TRAIFIC_ENGINE", "0")
 TROCR_MODEL_ID = os.getenv("TROCR_MODEL_ID", "paudelanil/trocr-devanagari-2")
 INFERENCE_SEMAPHORE = BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
-TRAIFIC_APP_DIR = ROOT / "TraificNPR" / "application"
+ALL_TEXT_ENGINES = ("malla", "indic", "paddle", "trocr", "kaggle")
+ALL_DETECTORS = ("tesseract", "paddle", "dbnet")
+ENGINE_LABELS = {
+    "malla": "Malla Pipeline (Core)",
+    "indic": "Indic Pipeline (Core)",
+    "paddle": "PaddleOCR (Core)",
+    "trocr": "TrOCR (Research)",
+    "kaggle": "Kaggle Classifier (Research)",
+}
+
+ENABLE_NON_CORE_PROFILE = _env_flag("OCR_ENABLE_NON_CORE_PROFILE", "0")
+CORE_TEXT_ENGINES = tuple(_csv_env_values("OCR_CORE_TEXT_ENGINES", "malla,indic,paddle", ALL_TEXT_ENGINES))
+CORE_DETECTORS = tuple(_csv_env_values("OCR_CORE_DETECTORS", "tesseract", ALL_DETECTORS))
+DEFAULT_ENGINE = CORE_TEXT_ENGINES[0] if CORE_TEXT_ENGINES else ALL_TEXT_ENGINES[0]
+
+
+def _active_text_engines():
+    engines = list(ALL_TEXT_ENGINES if ENABLE_NON_CORE_PROFILE else CORE_TEXT_ENGINES)
+    return engines or list(ALL_TEXT_ENGINES)
+
+
+def _active_detectors():
+    detectors = list(ALL_DETECTORS if ENABLE_NON_CORE_PROFILE else CORE_DETECTORS)
+    return detectors or list(ALL_DETECTORS)
+
+TRAIFIC_APP_DIR = RESEARCH_ROOT / "TraificNPR" / "application"
 if ENABLE_TRAIFIC_ENGINE and str(TRAIFIC_APP_DIR) not in sys.path:
     sys.path.append(str(TRAIFIC_APP_DIR))
 
@@ -1081,7 +1122,14 @@ def _api_token_is_valid(req):
 
 
 def _run_ocr(engine_choice, pil_image):
-    engine = (engine_choice or "paddle").strip().lower()
+    engine = (engine_choice or DEFAULT_ENGINE).strip().lower()
+    active_engines = _active_text_engines()
+    if engine not in active_engines:
+        profile_name = "core" if not ENABLE_NON_CORE_PROFILE else "full"
+        return {
+            "status": "error",
+            "message": f"Engine '{engine}' is not enabled in {profile_name} profile. Allowed engines: {', '.join(active_engines)}.",
+        }
 
     if engine == 'paddle':
         return extract_paddle_details(pil_image)
@@ -1093,11 +1141,26 @@ def _run_ocr(engine_choice, pil_image):
         return extract_malla_details(pil_image)
     if engine == 'kaggle':
         return extract_kaggle_details(pil_image)
-    return {"status": "error", "message": "Unknown engine selected. Use 'paddle', 'trocr', 'indic', 'malla', or 'kaggle'."}
+    return {"status": "error", "message": f"Unknown engine selected. Allowed engines: {', '.join(active_engines)}."}
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    core_engines = list(CORE_TEXT_ENGINES)
+    non_core_engines = [e for e in ALL_TEXT_ENGINES if e not in core_engines]
+    return render_template(
+        'index.html',
+        core_engines=core_engines,
+        non_core_engines=non_core_engines,
+        default_engine=DEFAULT_ENGINE,
+        engine_labels=ENGINE_LABELS,
+        non_core_enabled=ENABLE_NON_CORE_PROFILE,
+        core_benchmark_engines=','.join(core_engines),
+        all_benchmark_engines=','.join(ALL_TEXT_ENGINES),
+        core_benchmark_detectors=','.join(CORE_DETECTORS),
+        all_benchmark_detectors=','.join(ALL_DETECTORS),
+        default_benchmark_engines=','.join(_active_text_engines()),
+        default_benchmark_detectors=','.join(_active_detectors()),
+    )
 
 @app.route('/api/extract', methods=['POST'])
 def api_extract():
@@ -1108,7 +1171,11 @@ def api_extract():
     if file.filename == '':
         return jsonify({"error": "Empty filename"}), 400
 
-    engine_choice = request.form.get('engine', 'paddle')
+    engine_choice = (request.form.get('engine', DEFAULT_ENGINE) or DEFAULT_ENGINE).strip().lower()
+    active_engine_set = set(_active_text_engines())
+    if engine_choice not in active_engine_set:
+        return jsonify({"error": f"Engine '{engine_choice}' is not enabled. Allowed engines: {', '.join(sorted(active_engine_set))}"}), 400
+
     reference_text = request.form.get('reference_text', '')
     include_segments = request.form.get('include_segments', 'true').lower() in {'1', 'true', 'yes'}
     acquired = INFERENCE_SEMAPHORE.acquire(blocking=False)
@@ -1169,9 +1236,10 @@ def api_extract_v1():
     if file.filename == '':
         return jsonify({"error": "Empty filename"}), 400
 
-    engine_choice = request.form.get('engine', 'paddle')
-    if engine_choice not in {'paddle', 'trocr', 'indic', 'kaggle', 'malla'}:
-        return jsonify({"error": "Invalid engine. Use 'paddle', 'trocr', 'indic', 'malla', or 'kaggle'."}), 400
+    engine_choice = (request.form.get('engine', DEFAULT_ENGINE) or DEFAULT_ENGINE).strip().lower()
+    active_engine_set = set(_active_text_engines())
+    if engine_choice not in active_engine_set:
+        return jsonify({"error": f"Engine '{engine_choice}' is not enabled. Allowed engines: {', '.join(sorted(active_engine_set))}"}), 400
 
     include_debug = request.form.get('include_debug', 'false').lower() in {'1', 'true', 'yes'}
     include_segments = request.form.get('include_segments', 'false').lower() in {'1', 'true', 'yes'}
@@ -1242,19 +1310,21 @@ def _parse_csv_list(value, default_csv):
 def api_benchmark():
     payload = request.get_json(silent=True) or request.form.to_dict() or {}
 
-    engines = _parse_csv_list(payload.get('engines', ''), 'paddle,trocr,indic,malla')
-    detectors = _parse_csv_list(payload.get('detectors', ''), 'tesseract,paddle,dbnet')
+    active_engines = _active_text_engines()
+    active_detectors = _active_detectors()
+    engines = _parse_csv_list(payload.get('engines', ''), ','.join(active_engines))
+    detectors = _parse_csv_list(payload.get('detectors', ''), ','.join(active_detectors))
 
-    allowed_engines = {'paddle', 'trocr', 'indic', 'malla'}
-    allowed_detectors = {'tesseract', 'paddle', 'dbnet'}
+    allowed_engines = set(active_engines)
+    allowed_detectors = set(active_detectors)
 
     engines = [e for e in engines if e in allowed_engines]
     detectors = [d for d in detectors if d in allowed_detectors]
 
     if not engines:
-        engines = ['paddle', 'trocr', 'indic', 'malla']
+        engines = active_engines
     if not detectors:
-        detectors = ['tesseract', 'paddle', 'dbnet']
+        detectors = active_detectors
 
     k_folds = _parse_int(payload.get('k_folds', 5), 5, 2, 10)
     word_limit = _parse_int(payload.get('word_limit', 120), 120, 10, 5000)
